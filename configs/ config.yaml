@@ -1,0 +1,27 @@
+defaults:
+  - model: baseline
+  - data: hemoset
+  - trainer: default
+  - augmentation: default
+  - _self_
+
+experiment:
+  name: baseline
+  seed: 42
+  debug: false
+
+paths:
+  data: /work/tesi_cmininno/dataset
+  output: ${hydra:runtime.cwd}/experiments
+
+device: cuda
+
+logging:
+  wandb:
+    enabled: true
+    project: surgical-thesis-baseline
+    entity: null
+    mode: online
+
+  experiment_name: null
+  tags: []
