@@ -48,9 +48,12 @@ class Trainer:
 
         self.max_epochs = train_cfg.max_epochs
 
-        self.accumulation_steps = train_cfg.get(
-            "accumulation_steps",
+        self.accumulation_steps = max(
             1,
+            train_cfg.get(
+                "accumulation_steps",
+                1,
+            ),
         )
 
         self.eval_freq = train_cfg.get(
@@ -95,6 +98,10 @@ class Trainer:
         self.best_epoch = -1
         self.best_checkpoint: str | None = None
         self.epochs_without_improvement = 0
+
+        # Stored at the moment the best checkpoint is saved.
+        self.best_val_dice: float = float("nan")
+        self.best_val_iou: float = float("nan")
 
         # =====================================================
         # Model information
@@ -661,6 +668,10 @@ class Trainer:
 
         self.epochs_without_improvement = 0
 
+        # Store the best dice/iou at the moment of improvement.
+        self.best_val_dice = val_metrics.get("dice", float("nan"))
+        self.best_val_iou = val_metrics.get("iou", float("nan"))
+
         self.best_checkpoint = (
             self._save_checkpoint(epoch)
         )
@@ -908,15 +919,14 @@ class Trainer:
             "best_epoch":
                 self.best_epoch,
 
+            # Use the values stored when the best checkpoint was saved;
+            # do NOT index history by epoch number because history grows
+            # only at validation steps (every eval_freq epochs).
             "best_val_dice":
-                self.history[
-                    "val_dice"
-                ][self.best_epoch],
+                self.best_val_dice,
 
             "best_val_iou":
-                self.history[
-                    "val_iou"
-                ][self.best_epoch],
+                self.best_val_iou,
 
             "history":
                 self.history,

@@ -12,9 +12,8 @@ data:
     test: test
 
   # ATLAS-120k:
-  # 42 original classes -> 30 consolidated training classes
-  # Background + 30 foreground classes
-  num_classes: 31
+  # 47 original classes -> 30 consolidated training classes
+  num_classes: 30
 
   background_index: 0
 

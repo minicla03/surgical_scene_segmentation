@@ -131,9 +131,12 @@ def main(cfg: DictConfig):
                 pin_memory=cfg.train.pin_memory,
             )
 
-        print(f"Train batches: {len(train_loader)}")
-        print(f"Val batches  : {len(val_loader)}")
-        print(f"Test batches : {len(test_loader)}")
+        if train_loader is not None:
+            print(f"Train batches: {len(train_loader)}")
+        if val_loader is not None:
+            print(f"Val batches  : {len(val_loader)}")
+        if test_loader is not None:
+            print(f"Test batches : {len(test_loader)}")
 
         # Model
         model = instantiate(cfg.model.architecture).to(device)
@@ -167,6 +170,7 @@ def main(cfg: DictConfig):
             scaler=scaler,
             cfg=cfg,
             device=device,
+            logger=logger,
         )
 
         # =====================================================
@@ -196,6 +200,7 @@ def main(cfg: DictConfig):
             scaler=scaler,
             cfg=cfg,
             device=device,
+            logger=logger,
         )
 
         test_results = evaluator.evaluate()

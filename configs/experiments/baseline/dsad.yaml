@@ -59,7 +59,7 @@ augmentation:
 
 train:
   batch_size: 12
-  accumulation_steps: 0
+  accumulation_steps: 1
 
   max_epochs: 50
   eval_freq: 1

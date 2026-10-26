@@ -1,8 +1,9 @@
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from torch.utils.data import Subset
 
 from src.datasets.base_dataset import BaseSegmentationDataset
 
@@ -258,6 +259,43 @@ class CholecSeg8kDataset(BaseSegmentationDataset):
             "clip": info["clip"],
             "frame": info["frame"],
         }
+
+    # ======================================================
+    # Official split interface (required by start_experiment.py)
+    # ======================================================
+
+    def create_official_split(
+        self,
+        train_ratio: float = 0.70,
+        val_ratio: float = 0.15,
+        test_ratio: float = 0.15,
+        seed: int = 42,
+    ):
+        """
+        Return (train_subset, val_subset, test_subset) using a
+        reproducible random video-level split.
+
+        CholecSeg8k does not ship a fixed official split; this method
+        applies a deterministic 70/15/15 video-level partition so that
+        no video leaks across splits.
+
+        Returns
+        -------
+        tuple[Subset, Subset, Subset]
+        """
+
+        splits, _ = self.create_random_split(
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+        )
+
+        return (
+            splits["train"],
+            splits["val"],
+            splits["test"],
+        )
 
     # ======================================================
     # Split utilities

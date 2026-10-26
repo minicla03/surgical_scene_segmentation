@@ -19,11 +19,13 @@ class WandbLogger:
         tags: list[str] | None = None,
         mode: str = "online",
     ) -> None:
-        
+
+        # Inizializzato subito: garantisce che is_active esista
+        # anche se wandb.init() solleva un'eccezione.
+        self.is_active = False
         self.enabled = enabled
 
         if not self.enabled:
-            self.is_active = False
             return
 
         if wandb.run is None:
@@ -415,6 +417,48 @@ class WandbLogger:
             config,
             allow_val_change=True,
         )
+
+    # ------------------------------------------------------------------
+    # Final results (train summary + test)
+    # ------------------------------------------------------------------
+
+    def log_final_results(
+        self,
+        train_results: dict[str, Any],
+        test_results: dict[str, float],
+    ) -> None:
+        """Log a summary of the best training results and test metrics.
+
+        Args:
+            train_results:
+                Dictionary returned by Trainer.fit(), containing at
+                least 'best_epoch', 'best_val_dice', 'best_val_iou'.
+
+            test_results:
+                Dictionary returned by Evaluator.evaluate(), containing
+                at least 'loss', 'dice', 'iou', 'fps'.
+        """
+
+        if not self.is_active:
+            return
+
+        summary: dict[str, Any] = {}
+
+        # Training summary
+        for key, value in train_results.items():
+            if key == "history":
+                continue  # skip large lists
+            summary[f"train/{key}"] = value
+
+        # Test metrics
+        for key, value in test_results.items():
+            summary[f"test/{key}"] = value
+
+        wandb.log(summary)
+
+        # Also set as W&B run summary so it appears in the project table
+        for key, value in summary.items():
+            wandb.run.summary[key] = value  # type: ignore[union-attr]
 
     def finish(self) -> None:
         """Finish the current W&B run."""

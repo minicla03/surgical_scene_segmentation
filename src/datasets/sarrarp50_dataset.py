@@ -3,6 +3,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
+from torch.utils.data import Subset
 
 from src.datasets.base_dataset import BaseSegmentationDataset
 
@@ -144,10 +145,12 @@ class SARRARP50Dataset(BaseSegmentationDataset):
                 f"Unable to open video: {video_path}"
             )
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
 
-        success, frame = cap.read()
-        cap.release()
+            success, frame = cap.read()
+        finally:
+            cap.release()
 
         if not success:
             raise RuntimeError(
@@ -198,3 +201,50 @@ class SARRARP50Dataset(BaseSegmentationDataset):
             "video": sample_info["video"],
             "frame": frame_id,
         }
+
+    # =========================================================
+    # Official split interface (required by start_experiment.py)
+    # =========================================================
+
+    def create_official_split(
+        self,
+    ) -> tuple:
+        """
+        Return (train_subset, val_subset, test_subset).
+
+        SAR-RARP50 ships separate split directories on disk
+        (train/, val/, test/).  This method creates three
+        independent dataset instances, each pointing to the
+        corresponding sub-directory, and wraps them as Subset
+        objects for API uniformity with the other datasets.
+
+        Assumes self.root is the root containing train/, val/, test/.
+
+        Returns
+        -------
+        tuple[SARRARP50Dataset, SARRARP50Dataset, SARRARP50Dataset]
+        """
+
+        splits = []
+
+        for split_name in ("train", "val", "test"):
+
+            split_path = self.root / split_name
+
+            if split_path.exists():
+                split_ds = SARRARP50Dataset(
+                    root=str(self.root),
+                    split=split_name,
+                )
+            else:
+                # Gracefully handle a missing split directory
+                # (e.g. unlabelled test set).
+                split_ds = SARRARP50Dataset(
+                    root=str(self.root),
+                    split=split_name,
+                    preload_metadata=False,
+                )
+
+            splits.append(split_ds)
+
+        return tuple(splits)

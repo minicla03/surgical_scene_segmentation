@@ -17,10 +17,15 @@ data:
 
 
 preprocessing:
-  image_size: [512, 640]
+  image:
+    size: [512, 640]
+    channel_first: true
+    dtype: float32
+    normalize: true
 
-  normalization:
-    type: imagenet
+  mask:
+    channel_first: true
+    dtype: long
 
 
 augmentation:
