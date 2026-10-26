@@ -1,0 +1,38 @@
+ unet:
+    name: "U-Net"
+    family: "cnn"
+    task: "semantic_segmentation"
+
+    implementation:
+      type: "monai"
+      class: "monai.networks.nets.UNet"
+      repository: "Project-MONAI/MONAI"
+
+    architecture:
+      spatial_dims: 2
+      in_channels: 3
+      out_channels: ${experiment.baseline.data.num_classes}
+
+      channels:
+        - 64
+        - 128
+        - 256
+        - 512
+        - 1024
+
+      strides:
+        - 2
+        - 2
+        - 2
+        - 2
+
+      num_res_units: 2
+      kernel_size: 3
+      up_kernel_size: 3
+      act: "PRELU"
+      norm: "INSTANCE"
+      dropout: 0.0
+
+    pretrained:
+      enabled: false
+      weights: null

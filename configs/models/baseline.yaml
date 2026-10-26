@@ -1,0 +1,271 @@
+models:
+
+  # CNN
+  unet:
+    name: "U-Net"
+    family: "cnn"
+    task: "semantic_segmentation"
+
+    implementation:
+      type: "monai"
+      class: "monai.networks.nets.UNet"
+      repository: "Project-MONAI/MONAI"
+
+    architecture:
+      spatial_dims: 2
+      in_channels: 3
+      out_channels: ${dataset.num_classes}
+
+      channels:
+        - 64
+        - 128
+        - 256
+        - 512
+        - 1024
+
+      strides:
+        - 2
+        - 2
+        - 2
+        - 2
+
+      num_res_units: 2
+      kernel_size: 3
+      up_kernel_size: 3
+      act: "PRELU"
+      norm: "INSTANCE"
+      dropout: 0.0
+
+    pretrained:
+      enabled: false
+      weights: null
+
+  unetplusplus:
+    name: "U-Net++"
+    family: "cnn"
+    task: "semantic_segmentation"
+
+    implementation:
+      type: "monai"
+      class: "monai.networks.nets.BasicUNetPlusPlus"
+      repository: "Project-MONAI/MONAI"
+
+    architecture:
+      spatial_dims: 2
+
+      in_channels: 3
+      out_channels: ${dataset.num_classes}
+
+    
+      features:
+        - 32
+        - 32
+        - 64
+        - 128
+        - 256
+        - 32
+
+      deep_supervision: false
+
+      act:
+        name: "LeakyReLU"
+        args:
+          negative_slope: 0.1
+          inplace: true
+
+      norm:
+        name: "instance"
+        args:
+          affine: true
+
+      bias: true
+      dropout: 0.0
+      upsample: "deconv"
+
+
+  # TRANSFORMER
+  swin_unetr:
+    name: "SwinUNETR"
+    family: "transformer"
+    task: "semantic_segmentation"
+
+    implementation:
+      type: "monai"
+      class: "monai.networks.nets.SwinUNETR"
+      repository: "Project-MONAI/MONAI"
+
+    architecture:
+      spatial_dims: 2
+
+      in_channels: 3
+      out_channels: ${dataset.num_classes}
+
+      patch_size: 2
+
+      depths:
+        - 2
+        - 2
+        - 2
+        - 2
+
+      num_heads:
+        - 3
+        - 6
+        - 12
+        - 24
+
+      window_size: 7
+
+      feature_size: 24
+
+      norm_name: "instance"
+
+      drop_rate: 0.0
+      attn_drop_rate: 0.0
+      dropout_path_rate: 0.0
+
+      normalize: true
+      qkv_bias: true
+      mlp_ratio: 4.0
+
+      patch_norm: false
+      use_checkpoint: false
+
+      downsample: "merging"
+      use_v2: false
+
+  mask2former:
+    name: "Mask2Former"
+    family: "transformer"
+    task: "instance_and_semantic_segmentation"
+
+    implementation:
+      type: "official"
+      repository: "facebookresearch/Mask2Former"
+      framework: "Detectron2"
+
+    architecture:
+
+      backbone:
+        type: "SwinTransformer"
+
+        pretrain_img_size: 224
+        patch_size: 4
+
+        embed_dim: 96
+
+        depths:
+          - 2
+          - 2
+          - 6
+          - 2
+
+        num_heads:
+          - 3
+          - 6
+          - 12
+          - 24
+
+        window_size: 7
+
+        mlp_ratio: 4.0
+        qkv_bias: true
+
+      mask_former:
+        hidden_dim: 256
+        num_object_queries: 100
+
+        nheads: 8
+        dropout: 0.1
+
+        dim_feedforward: 2048
+
+        enc_layers: 0
+        dec_layers: 6
+
+        pre_norm: false
+
+        deep_supervision: true
+
+        no_object_weight: 0.1
+        class_weight: 1.0
+        mask_weight: 20.0
+        dice_weight: 1.0
+
+      pixel_decoder:
+        mask_dim: 256
+        transformer_encoder_layers: 0
+
+      inference:
+        semantic_on: true
+        instance_on: true
+        panoptic_on: false
+
+    pretrained:
+      enabled: true
+      source: "official_model_zoo"
+      weights: null
+
+
+  # MAMBA / STATE SPACE MODEL
+  u_mamba:
+    name: "U-Mamba"
+    family: "mamba"
+    task: "semantic_segmentation"
+
+    implementation:
+      type: "official"
+      repository: "bowang-lab/U-Mamba"
+      framework: "nnUNet"
+
+    architecture:
+
+      variant: "U-Mamba_Bot"
+
+      spatial_dims: 2
+
+      automatic_configuration: true
+
+      mamba:
+        enabled: true
+        location: "bottleneck"
+
+    pretrained:
+      enabled: false
+      weights: null
+
+    training_backend:
+      framework: "nnUNetv2"
+      trainer: "nnUNetTrainerUMambaBot"
+
+
+
+  u_mamba_encoder:
+    name: "U-Mamba Encoder"
+    family: "mamba"
+    task: "semantic_segmentation"
+
+    implementation:
+      type: "official"
+      repository: "bowang-lab/U-Mamba"
+      framework: "nnUNet"
+
+    architecture:
+
+      variant: "U-Mamba_Enc"
+
+      spatial_dims: 2
+
+      automatic_configuration: true
+
+      mamba:
+        enabled: true
+        location: "encoder"
+
+    pretrained:
+      enabled: false
+      weights: null
+
+    training_backend:
+      framework: "nnUNetv2"
+      trainer: "nnUNetTrainerUMambaEnc"

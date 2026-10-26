@@ -1,0 +1,98 @@
+defaults:
+  - _self_
+
+
+experiment:
+  name: sarrarp50_baseline
+
+
+data:
+  name: sarrarp50
+  root: ${paths.data}/SARRARP50
+
+  split:
+    type: official
+
+  num_classes: 10
+
+
+preprocessing:
+  image_size: [512, 640]
+
+  normalization:
+    type: imagenet
+
+
+augmentation:
+  train:
+
+    horizontal_flip:
+      enabled: true
+      p: 0.5
+
+    vertical_flip:
+      enabled: false
+
+    rotate:
+      enabled: true
+      limit: 10
+      p: 0.3
+
+    scale:
+      enabled: true
+      limit: 0.10
+      p: 0.3
+
+    shift:
+      enabled: true
+      limit: 0.05
+      p: 0.3
+
+    color_jitter:
+      enabled: true
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.05
+      p: 0.3
+
+  validation: null
+  test: null
+
+
+train:
+  batch_size: 4
+  accumulation_steps: 3
+
+  max_epochs: 50
+  eval_freq: 1
+
+  num_workers: 4
+  precision: "16-mixed"
+
+  initialization: scratch
+
+  optimizer:
+    name: adamw
+    lr: 1.0e-4
+    weight_decay: 1.0e-5
+
+  scheduler:
+    name: cosine
+    warmup_epochs: 5
+
+  loss:
+    name: dice_ce
+    dice_weight: 0.5
+    ce_weight: 0.5
+
+
+model:
+  name: baseline
+
+
+evaluation:
+  metrics:
+    - miou
+    - nsd
+    - dice
