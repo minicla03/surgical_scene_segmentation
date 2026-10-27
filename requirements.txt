@@ -2,7 +2,7 @@
 
 torch==2.1.2+cu118
 torchvision==0.16.2+cu118
-
+pycocotools==2.0.8
 
 opencv-python==4.8.0.76
 Pillow==10.0.0
