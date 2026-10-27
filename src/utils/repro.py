@@ -20,8 +20,13 @@ def set_seed(seed: int) -> None:
 
     torch.use_deterministic_algorithms(True, warn_only=True)
 
-#def seed_worker(worker_id: int) -> None:
-#    worker_seed = torch.initial_seed() % 2**32
-#
-#    np.random.seed(worker_seed)
-#    random.seed(worker_seed)
+def seed_worker() -> None:
+    """Seed each DataLoader worker for full reproducibility.
+
+    Must be passed as ``worker_init_fn`` to every DataLoader when
+    ``num_workers > 0`` so that stochastic transforms (random crop,
+    flip, …) produce the same results across runs.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from src.engine.trainer import Trainer
 from src.engine.evaluator import Evaluator
 
-from src.utils.repro import set_seed
+from src.utils.repro import set_seed, seed_worker
 from src.utils.wandb_logging import WandbLogger
 
 from src.datasets.transformation.factory import TransformFactory
@@ -20,7 +20,7 @@ from src.metrics.metric_manager import MetricManager
 
 @hydra.main(
     version_base=None,
-    config_path="../configs",
+    config_path="configs",
     config_name="config",
 )
 def main(cfg: DictConfig):
@@ -28,26 +28,21 @@ def main(cfg: DictConfig):
     # setup
     set_seed(cfg.experiment.seed)
 
+    # Reproducible generator for DataLoader workers
+    generator = torch.Generator()
+    generator.manual_seed(cfg.experiment.seed)
+
     device = torch.device(
         cfg.device
         if torch.cuda.is_available()
         else "cpu"
     )
 
-    experiment_name = cfg.logging.experiment_name
-
-    if experiment_name is None:
-        experiment_name = (
-            f"{cfg.data.name}_"
-            f"{cfg.model.name}_"
-            f"seed{cfg.experiment.seed}"
-        )
-
     logger = WandbLogger(
         enabled=cfg.logging.wandb.enabled,
         project=cfg.logging.wandb.project,
         entity=cfg.logging.wandb.entity,
-        name=experiment_name,
+        name=cfg.logging.experiment_name,
         config=dict(cfg),
         tags=list(cfg.logging.tags),
         mode=cfg.logging.wandb.mode,
@@ -109,6 +104,8 @@ def main(cfg: DictConfig):
                 shuffle=True,
                 num_workers=cfg.train.num_workers,
                 pin_memory=cfg.train.pin_memory,
+                worker_init_fn=seed_worker,
+                generator=generator,
             )
 
         if val_dataset is not None:
@@ -118,6 +115,8 @@ def main(cfg: DictConfig):
                 shuffle=False,
                 num_workers=cfg.train.num_workers,
                 pin_memory=cfg.train.pin_memory,
+                worker_init_fn=seed_worker,
+                generator=generator,
             )
 
         if test_dataset is not None:
@@ -127,6 +126,8 @@ def main(cfg: DictConfig):
                 shuffle=False,
                 num_workers=cfg.train.num_workers,
                 pin_memory=cfg.train.pin_memory,
+                worker_init_fn=seed_worker,
+                generator=generator,
             )
 
         if train_loader is not None:
@@ -158,11 +159,17 @@ def main(cfg: DictConfig):
         scaler = instantiate(cfg.train.scaler)
 
         # Metrics
-        metric_manager = MetricManager(
-            metrics=cfg.evaluation.metrics,
-            num_classes=cfg.data.num_classes,
-        )
+        metrics = {
+            name: instantiate(metric_cfg)
+            for name, metric_cfg in cfg.evaluation.metrics.items()
+        }
 
+        metric_manager = MetricManager(
+            metrics=metrics,
+            num_classes=cfg.data.num_classes,
+            dataset_name=cfg.data.name
+        )
+        
         # Trainer
         trainer = Trainer(
             model=model,
@@ -198,17 +205,17 @@ def main(cfg: DictConfig):
         # Test
         # =====================================================
 
-        evaluator = Evaluator(
-            model=model,
-            test_loader=test_loader,
-            loss_fn=loss_fn,
-            scaler=scaler,
-            cfg=cfg,
-            device=device,
-            logger=logger,
-        )
-
-        test_results = evaluator.evaluate()
+        #evaluator = Evaluator(
+        #    model=model,
+        #    test_loader=test_loader,
+        #    loss_fn=loss_fn,
+        #    scaler=scaler,
+        #    cfg=cfg,
+        #    device=device,
+        #    logger=logger,
+        #)
+#
+        #test_results = evaluator.evaluate()
 
         # =====================================================
         # Logging
@@ -216,7 +223,7 @@ def main(cfg: DictConfig):
 
         logger.log_final_results(
             train_results,
-            test_results,
+            {},
         )
 
     finally:
@@ -228,8 +235,8 @@ def main(cfg: DictConfig):
     print("FINAL TEST RESULTS")
     print("=" * 60)
 
-    for metric, value in test_results.items():
-        print(f"{metric}: {value:.4f}")
+    #for metric, value in test_results.items():
+    #    print(f"{metric}: {value:.4f}")
 
     print("=" * 60)
 

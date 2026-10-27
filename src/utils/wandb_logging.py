@@ -456,8 +456,9 @@ class WandbLogger:
         wandb.log(summary)
 
         # Also set as W&B run summary (appears in the project table)
-        for key, value in summary.items():
-            wandb.run.summary[key] = value  # type: ignore[union-attr]
+        if wandb.run is not None:
+            for key, value in summary.items():
+                wandb.run.summary[key] = value
 
 
     def finish(self) -> None:
