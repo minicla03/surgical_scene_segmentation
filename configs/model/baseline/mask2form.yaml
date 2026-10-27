@@ -1,0 +1,52 @@
+name: Mask2Former
+family: transformer
+task: semantic_segmentation
+
+implementation:
+  source: official
+  # https://github.com/facebookresearch/mask2former
+  repository: facebookresearch/Mask2Former
+  framework: detectron2
+
+architecture:
+  name: Mask2Former
+
+  # Backbone
+  backbone:
+    name: R-50
+    pretrained: true
+
+  # Mask2Former
+  num_queries: 100
+
+  hidden_dim: 256
+  num_heads: 8
+
+  encoder_layers: 6
+  decoder_layers: 10
+
+  dim_feedforward: 2048
+  dropout: 0.0
+
+  # Pixel decoder
+  feature_size: 256
+  mask_feature_size: 256
+
+  # Multi-scale features
+  feature_strides:
+    - 4
+    - 8
+    - 16
+    - 32
+
+  common_stride: 4
+
+  # Auxiliary predictions
+  use_auxiliary_loss: true
+
+  # Semantic segmentation
+  num_classes: ${data.num_classes}
+
+pretrained:
+  enabled: true
+  weights: null

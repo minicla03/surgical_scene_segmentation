@@ -1,0 +1,24 @@
+name: U-Mamba
+family: mamba
+task: semantic_segmentation
+
+implementation:
+  source: official
+  # https://github.com/bowang-lab/U-Mamba
+  repository: bowang-lab/U-Mamba
+  framework: nnunet
+
+architecture:
+  name: U-Mamba_Bot
+  dimensionality: 2d
+
+  trainer:
+    name: nnUNetTrainerUMambaBot
+
+  configuration: 2d
+
+  num_classes: ${data.num_classes}
+
+pretrained:
+  enabled: false
+  weights: null
