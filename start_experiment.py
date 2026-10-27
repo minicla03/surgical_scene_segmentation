@@ -16,7 +16,7 @@ from src.utils.wandb_logging import WandbLogger
 
 from src.datasets.transformation.factory import TransformFactory
 from src.datasets.transformation.transform_dataset import TransformDataset
-
+from src.metrics.metric_manager import MetricManager
 
 @hydra.main(
     version_base=None,
@@ -64,11 +64,9 @@ def main(cfg: DictConfig):
     try:
 
         # Dataset
-
         dataset = instantiate(cfg.data.dataset)
 
         print("\nDataset loaded.")
-
 
         train_dataset, val_dataset, test_dataset =  dataset.create_official_split()
 
@@ -141,25 +139,31 @@ def main(cfg: DictConfig):
         # Model
         model = instantiate(cfg.model.architecture).to(device)
 
-        # Train config
+        # Optimizer
         optimizer = instantiate(
-            cfg.trainer.optimizer,
+            cfg.train.optimizer,
             params=model.parameters(),
         )
 
+        # Scheduler
         scheduler = instantiate(
-            cfg.trainer.scheduler,
+            cfg.train.scheduler,
             optimizer=optimizer,
         )
 
-        loss_fn = instantiate(
-            cfg.trainer.loss
+        # Loss
+        loss_fn = instantiate(cfg.train.loss)
+
+        # AMP scaler
+        scaler = instantiate(cfg.train.scaler)
+
+        # Metrics
+        metric_manager = MetricManager(
+            metrics=cfg.evaluation.metrics,
+            num_classes=cfg.data.num_classes,
         )
 
-        scaler = instantiate(
-            cfg.trainer.scaler
-        )
-
+        # Trainer
         trainer = Trainer(
             model=model,
             train_loader=train_loader,
@@ -168,6 +172,7 @@ def main(cfg: DictConfig):
             scheduler=scheduler,
             loss_fn=loss_fn,
             scaler=scaler,
+            metric_manager=metric_manager,
             cfg=cfg,
             device=device,
             logger=logger,

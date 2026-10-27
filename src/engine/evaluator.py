@@ -1,20 +1,31 @@
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
+from src.utils.metrics import MetricComputer
+
 
 class Evaluator:
     """
-    Standalone evaluator that mirrors the Trainer validation loop.
+    Standalone test-set evaluator.
 
-    Computes loss, Dice, IoU and inference FPS on a test DataLoader
-    using the same _prepare_batch / _forward / _compute_metrics logic
-    as the Trainer.
+    Mirrors the Trainer validation loop but is driven entirely by
+    ``cfg.evaluation.metrics``.  The same MetricComputer used by the
+    Trainer is instantiated here, so training and test metrics are
+    always computed identically.
+
+    Always computed (hardcoded):
+        loss  — cross-entropy / combined loss from the forward pass
+        fps   — wall-clock inference frames per second
+
+    Configurable via cfg.evaluation.metrics:
+        dice / mdice, iou / miou, hd95, nsd
     """
 
     def __init__(
@@ -36,7 +47,8 @@ class Evaluator:
         self.device = device
         self.logger = logger
 
-        self.num_classes = int(cfg.data.num_classes)
+        # Metric computer — same factory as the Trainer uses.
+        self.metric_computer = MetricComputer.from_cfg(cfg)
 
     # =========================================================
     # AMP
@@ -61,15 +73,8 @@ class Evaluator:
         batch: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        x = batch["image"].to(
-            self.device,
-            non_blocking=True,
-        )
-
-        y = batch["mask"].to(
-            self.device,
-            non_blocking=True,
-        )
+        x = batch["image"].to(self.device, non_blocking=True)
+        y = batch["mask"].to(self.device, non_blocking=True)
 
         # [B, 1, H, W] -> [B, H, W]
         if y.ndim == 4 and y.shape[1] == 1:
@@ -92,10 +97,7 @@ class Evaluator:
         output = self.model(x)
 
         if isinstance(output, (list, tuple)):
-            losses = [
-                self.loss_fn(logits, y)
-                for logits in output
-            ]
+            losses = [self.loss_fn(logits, y) for logits in output]
             loss = sum(losses) / len(losses)
             logits = output[0]
         else:
@@ -103,61 +105,6 @@ class Evaluator:
             loss = self.loss_fn(logits, y)
 
         return logits, loss
-
-    # =========================================================
-    # Per-class Dice / IoU
-    # =========================================================
-
-    def _compute_metrics(
-        self,
-        predictions: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> dict[str, float]:
-
-        predictions = predictions.long()
-        labels = labels.long()
-
-        dice_values: list[float] = []
-        iou_values: list[float] = []
-
-        for class_id in range(self.num_classes):
-
-            pred_class = predictions == class_id
-            label_class = labels == class_id
-
-            intersection = (
-                pred_class & label_class
-            ).sum(dim=(1, 2)).float()
-
-            pred_area = pred_class.sum(dim=(1, 2)).float()
-            label_area = label_class.sum(dim=(1, 2)).float()
-
-            union = pred_area + label_area - intersection
-
-            dice = (2.0 * intersection + 1e-8) / (
-                pred_area + label_area + 1e-8
-            )
-
-            iou = (intersection + 1e-8) / (union + 1e-8)
-
-            valid = (pred_area + label_area) > 0
-
-            if valid.any():
-                dice_values.append(dice[valid].mean().item())
-                iou_values.append(iou[valid].mean().item())
-
-        return {
-            "dice": (
-                float(np.mean(dice_values))
-                if dice_values
-                else 0.0
-            ),
-            "iou": (
-                float(np.mean(iou_values))
-                if iou_values
-                else 0.0
-            ),
-        }
 
     # =========================================================
     # Evaluate
@@ -168,41 +115,48 @@ class Evaluator:
         """
         Run the full test loop and return aggregated metrics.
 
+        Always returns:
+            loss  — mean loss over the test set
+            fps   — inference frames per second
+
+        Additionally returns every metric configured in
+        ``cfg.evaluation.metrics`` (e.g. dice, iou, hd95, nsd).
+
         Returns
         -------
-        dict with keys: loss, dice, iou, fps
+        dict[str, float]
         """
 
         print("\n" + "=" * 60)
         print("TEST EVALUATION")
         print("=" * 60)
+        print(
+            f"Metrics : {['loss', 'fps'] + self.metric_computer.names}"
+        )
+        print("=" * 60)
 
         self.model.eval()
 
-        test_losses: list[float] = []
-        dice_values: list[float] = []
-        iou_values: list[float] = []
-
-        total_images = 0
+        total_images     = 0
         total_model_time = 0.0
 
-        progress = tqdm(
-            self.test_loader,
-            desc="Test",
-        )
+        # Accumulate per-batch values for every metric
+        accumulated: dict[str, list[float]] = defaultdict(list)
+
+        progress = tqdm(self.test_loader, desc="Test")
 
         for batch in progress:
 
             x, y = self._prepare_batch(batch)
 
             # -------------------------------------------------
-            # Inference timing
+            # Timed inference
             # -------------------------------------------------
 
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
 
-            start_time = time.perf_counter()
+            t0 = time.perf_counter()
 
             with self._autocast():
                 logits, loss = self._forward(x, y)
@@ -210,53 +164,77 @@ class Evaluator:
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
 
-            total_model_time += (
-                time.perf_counter() - start_time
-            )
+            total_model_time += time.perf_counter() - t0
 
-            test_losses.append(loss.detach().item())
+            accumulated["loss"].append(loss.detach().item())
 
             # -------------------------------------------------
-            # Predictions & metrics
+            # Predictions
             # -------------------------------------------------
 
             predictions = torch.argmax(logits, dim=1)
 
-            batch_metrics = self._compute_metrics(
-                predictions,
-                y,
+            # -------------------------------------------------
+            # Configurable metrics (via MetricComputer)
+            # -------------------------------------------------
+
+            batch_metrics = self.metric_computer.compute(
+                predictions, y
             )
 
-            dice_values.append(batch_metrics["dice"])
-            iou_values.append(batch_metrics["iou"])
+            for name, value in batch_metrics.items():
+                accumulated[name].append(value)
 
             total_images += x.shape[0]
 
-            progress.set_postfix(
-                loss=f"{loss.item():.4f}",
-                dice=f"{batch_metrics['dice']:.4f}",
+            # Progress bar: show first soft metric if available
+            first_metric = (
+                self.metric_computer.names[0]
+                if self.metric_computer.names
+                else None
             )
+            postfix: dict[str, str] = {
+                "loss": f"{loss.item():.4f}",
+            }
+            if first_metric is not None:
+                val = batch_metrics.get(first_metric, float("nan"))
+                if not np.isnan(val):
+                    postfix[first_metric] = f"{val:.4f}"
+
+            progress.set_postfix(**postfix)
 
         # =====================================================
-        # Aggregate
+        # Aggregate  (nanmean handles hd95/nsd NaN batches)
         # =====================================================
 
-        fps = total_images / max(total_model_time, 1e-8)
-
-        results = {
-            "loss": float(np.mean(test_losses)),
-            "dice": (
-                float(np.mean(dice_values))
-                if dice_values
-                else float("nan")
-            ),
-            "iou": (
-                float(np.mean(iou_values))
-                if iou_values
-                else float("nan")
-            ),
-            "fps": fps,
+        results: dict[str, float] = {
+            name: float(np.nanmean(values)) if values else float("nan")
+            for name, values in accumulated.items()
         }
+
+        # FPS always hardcoded
+        results["fps"] = total_images / max(total_model_time, 1e-8)
+
+        # =====================================================
+        # Console summary
+        # =====================================================
+
+        print("\n" + "=" * 60)
+        print("TEST RESULTS")
+        print("=" * 60)
+
+        print(f"Loss    : {results.get('loss', float('nan')):.4f}")
+        print(f"FPS     : {results.get('fps', float('nan')):.2f}")
+
+        for metric_name in self.metric_computer.names:
+            value = results.get(metric_name, float("nan"))
+            label = metric_name.upper()
+            if np.isnan(value):
+                print(f"{label:<8}: N/A")
+            else:
+                print(f"{label:<8}: {value:.4f}")
+
+        print("=" * 60)
 
         # =====================================================
         # W&B logging

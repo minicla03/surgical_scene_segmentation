@@ -1,4 +1,6 @@
 defaults:
+  - experiment: baseline/cholecseg8k
+  - model: unet
   - _self_
 
 experiment:

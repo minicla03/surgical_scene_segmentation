@@ -9,6 +9,7 @@
       repository: "Project-MONAI/MONAI"
 
     architecture:
+      _target_: monai.networks.nets.UNet
       spatial_dims: 2
       in_channels: 3
       out_channels: ${experiment.baseline.data.num_classes}

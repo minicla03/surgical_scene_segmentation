@@ -20,8 +20,6 @@ class WandbLogger:
         mode: str = "online",
     ) -> None:
 
-        # Inizializzato subito: garantisce che is_active esista
-        # anche se wandb.init() solleva un'eccezione.
         self.is_active = False
         self.enabled = enabled
 
@@ -63,7 +61,6 @@ class WandbLogger:
         learning_rate: float | None = None,
         metrics: dict[str, float] | None = None,
     ) -> None:
-        """Log metrics collected during a training epoch."""
 
         if not self.is_active:
             return
@@ -100,7 +97,6 @@ class WandbLogger:
         metrics: dict[str, float],
         prefix: str = "test",
     ) -> None:
-        """Log final test metrics."""
 
         if not self.is_active:
             return
@@ -432,11 +428,11 @@ class WandbLogger:
         Args:
             train_results:
                 Dictionary returned by Trainer.fit(), containing at
-                least 'best_epoch', 'best_val_dice', 'best_val_iou'.
+                least 'best_epoch', 'best_val_metrics', 'history'.
 
             test_results:
                 Dictionary returned by Evaluator.evaluate(), containing
-                at least 'loss', 'dice', 'iou', 'fps'.
+                at least 'loss', 'fps', and any configured metrics.
         """
 
         if not self.is_active:
@@ -444,11 +440,14 @@ class WandbLogger:
 
         summary: dict[str, Any] = {}
 
-        # Training summary
-        for key, value in train_results.items():
-            if key == "history":
-                continue  # skip large lists
-            summary[f"train/{key}"] = value
+        # Best validation metrics (dynamic dict from Trainer)
+        best_val = train_results.get("best_val_metrics", {})
+        for key, value in best_val.items():
+            summary[f"train/best_val_{key}"] = value
+
+        summary["train/best_epoch"] = train_results.get(
+            "best_epoch", -1
+        )
 
         # Test metrics
         for key, value in test_results.items():
@@ -456,9 +455,10 @@ class WandbLogger:
 
         wandb.log(summary)
 
-        # Also set as W&B run summary so it appears in the project table
+        # Also set as W&B run summary (appears in the project table)
         for key, value in summary.items():
             wandb.run.summary[key] = value  # type: ignore[union-attr]
+
 
     def finish(self) -> None:
         """Finish the current W&B run."""
