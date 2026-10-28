@@ -1,14 +1,12 @@
-defaults:
-  - _self_
-
-
 experiment:
   name: sarrarp50_baseline
 
-
 data:
   name: sarrarp50
-  root: ${paths.data}/SARRARP50
+
+  dataset:
+    _target_: src.datasets.sarrarp50_dataset.SARRARP50Dataset
+    root: ${paths.data}/SARRARP50
 
   split:
     type: official
@@ -30,39 +28,43 @@ preprocessing:
 
 augmentation:
   train:
+    enabled: true
+
+    scaling:
+      enabled: true
+      range: [-0.10, 0.10]
+      probability: 0.3
+
+    rotation:
+      enabled: true
+      range: [-10, 10]
+      probability: 0.3
+
+    translation:
+      enabled: true
+      range: [-0.05, 0.05]
+      probability: 0.3
 
     horizontal_flip:
       enabled: true
-      p: 0.5
+      probability: 0.5
 
     vertical_flip:
       enabled: false
 
-    rotate:
-      enabled: true
-      limit: 10
-      p: 0.3
-
-    scale:
-      enabled: true
-      limit: 0.10
-      p: 0.3
-
-    shift:
-      enabled: true
-      limit: 0.05
-      p: 0.3
-
     color_jitter:
       enabled: true
+      probability: 0.3
       brightness: 0.2
       contrast: 0.2
       saturation: 0.2
       hue: 0.05
-      p: 0.3
 
-  validation: null
-  test: null
+  validation:
+    enabled: false
+
+  test:
+    enabled: false
 
 
 train:
@@ -73,6 +75,8 @@ train:
   eval_freq: 1
 
   num_workers: 4
+  pin_memory: true
+
   precision: "16-mixed"
 
   initialization: scratch
@@ -98,6 +102,29 @@ model:
 
 evaluation:
   metrics:
-    - miou
-    - nsd
-    - dice
+    dice:
+      _target_: monai.metrics.DiceMetric
+      include_background: true
+      reduction: mean
+
+    iou:
+      _target_: monai.metrics.MeanIoU
+      include_background: true
+      reduction: mean
+
+    hd95:
+      _target_: monai.metrics.HausdorffDistanceMetric
+      include_background: true
+      percentile: 95
+      reduction: mean
+
+  foreground_only: false
+  save_predictions: false
+
+
+logging:
+  experiment_name: sarrarp50_baseline
+
+  tags:
+    - sarrarp50
+    - baseline

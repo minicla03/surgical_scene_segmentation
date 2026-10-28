@@ -3,7 +3,7 @@ from __future__ import annotations
 import hydra
 import torch
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from hydra.utils import instantiate
 
 from torch.utils.data import DataLoader
@@ -41,9 +41,11 @@ def main(cfg: DictConfig):
     logger = WandbLogger(
         enabled=cfg.logging.wandb.enabled,
         project=cfg.logging.wandb.project,
-        entity=cfg.logging.wandb.entity,
         name=cfg.logging.experiment_name,
-        config=dict(cfg),
+        config=OmegaConf.to_container(
+            cfg,
+            resolve=True,
+        ),
         tags=list(cfg.logging.tags),
         mode=cfg.logging.wandb.mode,
     )
@@ -63,7 +65,7 @@ def main(cfg: DictConfig):
 
         print("\nDataset loaded.")
 
-        train_dataset, val_dataset, test_dataset =  dataset.create_official_split()
+        train_dataset, val_dataset, test_dataset = dataset.create_official_split()
 
         print(f"Train samples: {len(train_dataset)}")
         print(f"Val samples  : {len(val_dataset)}")

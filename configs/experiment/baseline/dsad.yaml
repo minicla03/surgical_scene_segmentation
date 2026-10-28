@@ -1,9 +1,15 @@
-experiment:
-  name: dsad_baseline
+# https://pmc.ncbi.nlm.nih.gov/articles/PMC10583931/
+# split: https://huggingface.co/datasets/nct-tso/dsad/blob/main
+
+
+name: dsad_baseline
 
 data:
   name: dsad
-  root: ${paths.data}/DSAD
+
+  dataset:
+    _target_: src.datasets.dsad_dataset.DSADDataset
+    root: ${paths.data}/DSAD
 
   variant: single_organ
 
@@ -34,21 +40,22 @@ augmentation:
   train:
     enabled: true
 
-    horizontal_flip:
+    scaling:
       enabled: true
+      range: [-0.1, 0.1]
       probability: 0.5
-
-    vertical_flip:
-      enabled: false
 
     rotation:
       enabled: true
       range: [-15, 15]
       probability: 0.5
 
-    zoom:
+    brightness:
       enabled: true
-      range: [0.9, 1.1]
+      probability: 0.5
+
+    contrast:
+      enabled: true
       probability: 0.5
 
   validation:
@@ -88,10 +95,23 @@ train:
 
 evaluation:
   metrics:
-    - dice
-    - iou
-    - hd95
+    dice:
+      _target_: monai.metrics.DiceMetric
+      include_background: true
+      reduction: mean
 
+    iou:
+      _target_: monai.metrics.MeanIoU
+      include_background: true
+      reduction: mean
+
+    hd95:
+      _target_: monai.metrics.HausdorffDistanceMetric
+      include_background: true
+      percentile: 95
+      reduction: mean
+
+  foreground_only: false
   save_predictions: false
 
 logging:

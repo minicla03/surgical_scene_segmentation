@@ -1,17 +1,19 @@
+# @package _global_
+
 # https://pmc.ncbi.nlm.nih.gov/articles/PMC11022235
-
-experiment:
-  name: cholecseg8k_baseline
-
 
 # ============================================================
 # DATASET
 # ============================================================
 
+name: cholec_instance_seg8k
+
 data:
   name: cholecseg8k
 
-  root: ${paths.data}/CholecSeg8k
+  dataset:
+    _target_: src.datasets.cholecseg8k.CholecSeg8kDataset
+    root: ${paths.data}/CholecSeg8k
 
   split:
     type: video_based
@@ -27,8 +29,7 @@ data:
         - 43
 
     test:
-      videos:
-        
+      videos: []
 
   num_classes: 13
 
@@ -55,16 +56,18 @@ data:
 preprocessing:
 
   image:
-    size: [480, 854]
-
+    size: [240, 427]
     channel_first: true
     dtype: float32
-
     normalize: true
 
   mask:
     channel_first: true
     dtype: long
+
+  padding:
+    enabled: true
+    divisor: 16
 
 
 # ============================================================
@@ -80,24 +83,20 @@ augmentation:
       enabled: true
       probability: 0.5
 
-    vertical_flip:
-      enabled: false
-
-    rotation:
+    scaling:
       enabled: true
-      range: [-10, 10]
-      probability: 0.5
+      range: [-0.1, 0.1]
+      probability: 1.0
 
-    zoom:
+    gaussian_blur:
       enabled: true
-      range: [0.9, 1.1]
-      probability: 0.5
+      probability: 1.0
+      kernel_sizes: [3, 5, 7]
+      sigmas: [0.8, 1.1, 1.4]
 
-    contrast:
-      enabled: false
-
-    gaussian_noise:
-      enabled: false
+    random_crop:
+      enabled: true
+      size: [256, 256]
 
   validation:
     enabled: false
@@ -111,7 +110,6 @@ augmentation:
 # ============================================================
 
 train:
-
   batch_size: 4
   accumulation_steps: 3
 
@@ -127,18 +125,22 @@ train:
 
   optimizer:
     _target_: torch.optim.AdamW
-    name: AdamW
     lr: 0.0001
     weight_decay: 0.00001
 
   scheduler:
-    name: cosine
-    warmup_epochs: 5
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: ${train.max_epochs}
+
+  scaler:
+    _target_: torch.cuda.amp.GradScaler
 
   loss:
-    name: dice_ce
-    dice_weight: 0.5
-    ce_weight: 0.5
+    _target_: monai.losses.DiceCELoss
+    include_background: true
+    to_onehot_y: true
+    softmax: true
+
 
 # ============================================================
 # EVALUATION
@@ -147,25 +149,22 @@ train:
 evaluation:
 
   metrics:
-    - dice
-    - iou
-    - hd95
+
+    dice:
+      _target_: monai.metrics.DiceMetric
+      include_background: true
+      reduction: mean
+
+    iou:
+      _target_: monai.metrics.MeanIoU
+      include_background: true
+      reduction: mean
+
+    hd95:
+      _target_: monai.metrics.HausdorffDistanceMetric
+      include_background: true
+      percentile: 95
+      reduction: mean
 
   foreground_only: false
-
   save_predictions: false
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging:
-
-  experiment_name: cholecseg8k_basic_unet
-
-  tags:
-    - cholecseg8k
-    - baseline
-    - semantic-segmentation
-    - 13-class

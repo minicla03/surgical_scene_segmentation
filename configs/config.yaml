@@ -1,25 +1,25 @@
 defaults:
-  - experiment: baseline/cholecseg8k
-  - model: unet
+  - experiment: baseline/cholec_instance_seg8k
+  - model: baseline/unet
   - _self_
 
 experiment:
-  name: baseline
   seed: 42
   debug: false
 
 paths:
   data: /work/tesi_cmininno/dataset
   output: ${hydra:runtime.cwd}/experiments
+  checkpoint: /work/tesi_cmininno/checkpoint/${name}/${model.name}
 
 device: cuda
 
 logging:
   wandb:
     enabled: true
-    project: surgical-thesis-baseline
-    entity: null
+    project: surgical_scene_segmentation
+    entity: mininnoclaudio-unimore
     mode: online
 
-  experiment_name: null
+  experiment_name: ${name}_${model.name}
   tags: []

@@ -1,9 +1,13 @@
 experiment:
   name: atlas120k_baseline
 
+
 data:
   name: atlas120k
-  root: ${paths.data}/atlas120k
+
+  dataset:
+    _target_: src.datasets.atlas120k_dataset.ATLAS120KDataset
+    root: ${paths.data}/atlas120k
 
   split:
     type: official
@@ -11,15 +15,13 @@ data:
     validation: val
     test: test
 
-  # ATLAS-120k:
-  # 47 original classes -> 30 consolidated training classes
   num_classes: 30
-
   background_index: 0
 
   taxonomy:
     type: consolidated
     num_foreground_classes: 30
+
 
 preprocessing:
   image:
@@ -32,9 +34,20 @@ preprocessing:
     channel_first: true
     dtype: long
 
+
 augmentation:
   train:
     enabled: true
+
+    scaling:
+      enabled: true
+      range: [-0.10, 0.10]
+      probability: 0.5
+
+    rotation:
+      enabled: true
+      range: [-15, 15]
+      probability: 0.5
 
     horizontal_flip:
       enabled: true
@@ -43,31 +56,18 @@ augmentation:
     vertical_flip:
       enabled: false
 
-    rotation:
-      enabled: true
-      range: [-15, 15]
-      probability: 0.5
-
-    zoom:
-      enabled: true
-      range: [0.9, 1.1]
-      probability: 0.5
-
   validation:
     enabled: false
 
   test:
     enabled: false
 
+
 train:
-
-  # from paper
   batch_size: 24
-
   accumulation_steps: 1
 
   max_epochs: 10
-
   eval_freq: 1
 
   num_workers: 4
@@ -75,15 +75,10 @@ train:
 
   precision: "16-mixed"
 
-  # Paper uses in-domain pretrained initialization.
-  # For our generic supervised baseline we keep this configurable.
   initialization: imagenet
 
   optimizer:
     name: AdamW
-
-    # To be filled from the baseline/model implementation
-    # if not explicitly specified for the architecture.
     lr: 0.0001
     weight_decay: 0.00001
 
@@ -93,35 +88,37 @@ train:
 
   loss:
     name: dice_bce
-
-    # These are the mask-loss weights reported for ATLAS.
     dice_weight: 5.0
     bce_weight: 5.0
 
-evaluation:
 
-  # Official ATLAS evaluation
+model:
+  name: baseline
+
+
+evaluation:
   metrics:
-    - miou
-    - mdice
-    - ap
-    - ap50
-    - ap75
-    - mvc12
-    - mvc24
+    miou:
+      _target_: monai.metrics.MeanIoU
+      include_background: false
+      reduction: mean
+
+    dice:
+      _target_: monai.metrics.DiceMetric
+      include_background: false
+      reduction: mean
+
+    ap:
+        enabled: true
+
+    ap50:
+      enabled: true
+
+    ap75:
+      enabled: true
 
   foreground_only: true
-
   num_foreground_classes: 30
-
-  compute_ap: true
-
-  temporal_metrics:
-    enabled: true
-    windows:
-      - 12
-      - 24
-
   save_predictions: false
 
 logging:

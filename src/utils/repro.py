@@ -20,7 +20,7 @@ def set_seed(seed: int) -> None:
 
     torch.use_deterministic_algorithms(True, warn_only=True)
 
-def seed_worker() -> None:
+def seed_worker(worker_id: int) -> None:
     """Seed each DataLoader worker for full reproducibility.
 
     Must be passed as ``worker_init_fn`` to every DataLoader when
