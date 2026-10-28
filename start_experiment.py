@@ -40,6 +40,7 @@ def main(cfg: DictConfig):
         log_step(1, f"Setup completed. Device: {device}")
 
         log_step(2, "Initializing WandB logger...")
+
         logger = WandbLogger(
             enabled=cfg.logging.wandb.enabled,
             project=cfg.logging.wandb.project,
@@ -80,6 +81,7 @@ def main(cfg: DictConfig):
         test_loader = None
 
         if train_dataset is not None:
+
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=cfg.train.batch_size,
@@ -89,7 +91,9 @@ def main(cfg: DictConfig):
                 worker_init_fn=seed_worker,
                 generator=generator,
             )
+
         if val_dataset is not None:
+
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=cfg.train.batch_size,
@@ -99,7 +103,9 @@ def main(cfg: DictConfig):
                 worker_init_fn=seed_worker,
                 generator=generator,
             )
+
         if test_dataset is not None:
+
             test_loader = DataLoader(
                 test_dataset,
                 batch_size=cfg.train.batch_size,
@@ -121,6 +127,7 @@ def main(cfg: DictConfig):
         log_step(7, "Building model...")
         model = instantiate(cfg.model.architecture).to(device)
         log_step(7, "Model initialized.")
+        logger.log_model_info(model, model_name=cfg.model.name)
 
         log_step(8, "Building optimizer, scheduler, loss...")
         optimizer = instantiate(cfg.train.optimizer, params=model.parameters())
@@ -129,7 +136,11 @@ def main(cfg: DictConfig):
         log_step(8, "Optimization components initialized.")
 
         log_step(9, "Initializing AMP scaler...")
-        scaler = instantiate(cfg.train.scaler)
+        scaler = None
+
+        if "scaler" in cfg.train:
+            scaler = instantiate(cfg.train.scaler)
+        
         log_step(9, "AMP scaler initialized.")
 
         log_step(10, "Initializing metrics...")
@@ -137,10 +148,16 @@ def main(cfg: DictConfig):
             name: instantiate(metric_cfg)
             for name, metric_cfg in cfg.evaluation.metrics.items()
         }
+        # Costruiamo il mapping class_index -> class_name dal config (se disponibile)
+        class_names: dict[int, str] | None = None
+        raw_classes = cfg.data.get("classes", None)
+        if raw_classes is not None:
+            class_names = {int(k): str(v) for k, v in raw_classes.items()}
         metric_manager = MetricManager(
             metrics=metrics,
             num_classes=cfg.data.num_classes,
             dataset_name=cfg.data.name,
+            class_names=class_names,
         )
         log_step(10, "Metrics initialized.")
 

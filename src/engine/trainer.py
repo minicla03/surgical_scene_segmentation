@@ -46,7 +46,7 @@ class Trainer:
         logging_cfg = cfg.get("logging", {})
         qualitative_cfg = logging_cfg.get("qualitative", {})
         self.qualitative_enabled = bool(qualitative_cfg.get("enabled", True))
-        self.qualitative_freq = max(1, int(qualitative_cfg.get("frequency", self.eval_freq)))
+        self.qualitative_freq = max(1, int(qualitative_cfg.get("frequency", 1)))
         self.qualitative_max_samples = max(1, int(qualitative_cfg.get("max_samples", 4)))
 
         early_stopping_cfg = train_cfg.get("early_stopping", {})
@@ -122,10 +122,11 @@ class Trainer:
         enabled = self.scaler is not None and self.device.type == "cuda"
         return torch.amp.autocast("cuda", enabled=enabled)
 
-    def train_epoch(self, epoch: int) -> float:
+    def train_epoch(self, epoch: int) -> tuple[float, float]:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         losses: list[float] = []
+        grad_norms: list[float] = []
         progress = tqdm(self.train_loader, desc=f"Train [{epoch + 1}/{self.max_epochs}]")
         num_steps = len(self.train_loader)
 
@@ -147,6 +148,16 @@ class Trainer:
             is_update_step = (step + 1) % self.accumulation_steps == 0 or (step + 1) == num_steps
 
             if is_update_step:
+                # Unscale prima di calcolare la norma del gradiente
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=float("inf")
+                ).item()
+                if np.isfinite(grad_norm):
+                    grad_norms.append(grad_norm)
+
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -156,7 +167,7 @@ class Trainer:
 
             progress.set_postfix(loss=f"{real_loss:.4f}")
 
-        return self._safe_mean(losses)
+        return self._safe_mean(losses), self._safe_mean(grad_norms)
 
     @torch.inference_mode()
     def validate(self, epoch: int) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
@@ -169,7 +180,7 @@ class Trainer:
 
         progress = tqdm(self.val_loader, desc=f"Val   [{epoch + 1}/{self.max_epochs}]")
         qualitative_batch = None
-        collect_qualitative = self.qualitative_enabled and ((epoch + 1) % self.qualitative_freq == 0)
+        collect_qualitative = self.qualitative_enabled and (epoch == 0 or (epoch + 1) % self.qualitative_freq == 0)
 
         for batch in progress:
             x, y = self._prepare_batch(batch)
@@ -201,11 +212,12 @@ class Trainer:
                 }
 
         results = self.metric_manager.compute()
+        per_class_results = self.metric_manager.compute_per_class()
         results["loss"] = total_loss / max(num_batches, 1)
         results["fps"] = total_images / max(total_model_time, 1e-8)
         results = {key: float(value) for key, value in results.items()}
 
-        return results, qualitative_batch
+        return results, per_class_results, qualitative_batch
 
     def _save_checkpoint(self, epoch: int) -> str:
         output_dir = Path(self.cfg.paths.checkpoint)
@@ -260,9 +272,7 @@ class Trainer:
         epoch: int,
         train_loss: float,
         val_metrics: dict[str, float],
-        train_time: float,
-        val_time: float,
-        epoch_time: float,
+        val_per_class: dict[str, float],
         qualitative_batch: dict[str, torch.Tensor] | None,
     ) -> None:
         if self.logger is None:
@@ -270,28 +280,10 @@ class Trainer:
 
         wandb_step = epoch + 1
 
-        extra_metrics = {
-            "epoch/train_batches": len(self.train_loader),
-            "epoch/val_batches": len(self.val_loader),
-            "time/train_seconds": train_time,
-            "time/val_seconds": val_time,
-            "time/epoch_seconds": epoch_time,
-            "training/best_score": self.best_score if np.isfinite(self.best_score) else float("nan"),
-            "training/best_epoch": self.best_epoch + 1 if self.best_epoch >= 0 else 0,
-            "training/epochs_without_improvement": self.epochs_without_improvement,
-        }
-
-        if self.device.type == "cuda":
-            extra_metrics["system/gpu_memory_allocated_mb"] = torch.cuda.memory_allocated() / 1024**2
-            extra_metrics["system/gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / 1024**2
-            extra_metrics["system/gpu_max_memory_allocated_mb"] = torch.cuda.max_memory_allocated() / 1024**2
-
-        self.logger.log_metrics(extra_metrics, step=wandb_step, commit=False)
-
         if qualitative_batch is not None:
             num_classes = int(self.cfg.data.num_classes)
             class_labels = {index: f"class_{index}" for index in range(num_classes)}
-            configured_labels = self.cfg.data.get("class_labels", None)
+            configured_labels = self.cfg.data.get("classes", self.cfg.data.get("class_labels", None))
 
             if configured_labels is not None:
                 if isinstance(configured_labels, dict):
@@ -309,10 +301,11 @@ class Trainer:
                 max_samples=self.qualitative_max_samples,
             )
 
-        # 3. Loss, LR e metriche principali (commit=True: chiude lo step)
         log_metrics = {"fps": val_metrics["fps"]}
         for metric_name in self.metric_names:
             log_metrics[metric_name] = val_metrics.get(metric_name, float("nan"))
+        if val_per_class:
+            log_metrics.update(val_per_class)
 
         self.logger.log_epoch_metrics(
             epoch=epoch,
@@ -335,27 +328,37 @@ class Trainer:
             print(f"\nEpoch {epoch + 1}/{self.max_epochs}")
 
             train_start = time.perf_counter()
-            train_loss = self.train_epoch(epoch)
+            train_loss, grad_norm = self.train_epoch(epoch)
             train_time = time.perf_counter() - train_start
 
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            should_validate = (epoch + 1) % self.eval_freq == 0 or (epoch + 1) == self.max_epochs
+            self.history["train_loss"].append(train_loss)
+            self.history["train_time"].append(train_time)
+
+            should_validate = (epoch == 0) or ((epoch + 1) % self.eval_freq == 0) or ((epoch + 1) == self.max_epochs)
 
             if not should_validate:
+                epoch_time = time.perf_counter() - epoch_start
+                self.history["epoch_time"].append(epoch_time)
                 print(f"Train Loss : {train_loss:.4f}")
+                if self.logger is not None:
+                    self.logger.log_epoch_metrics(
+                        epoch=epoch,
+                        train_loss=train_loss,
+                        learning_rate=self.optimizer.param_groups[0]["lr"],
+                        step=epoch + 1,
+                    )
                 continue
 
             val_start = time.perf_counter()
-            val_metrics, qualitative_batch = self.validate(epoch)
+            val_metrics, val_per_class, qualitative_batch = self.validate(epoch)
             val_time = time.perf_counter() - val_start
             epoch_time = time.perf_counter() - epoch_start
 
-            self.history["train_loss"].append(train_loss)
             self.history["val_loss"].append(val_metrics["loss"])
             self.history["val_fps"].append(val_metrics["fps"])
-            self.history["train_time"].append(train_time)
             self.history["val_time"].append(val_time)
             self.history["epoch_time"].append(epoch_time)
 
@@ -374,9 +377,7 @@ class Trainer:
                 epoch=epoch,
                 train_loss=train_loss,
                 val_metrics=val_metrics,
-                train_time=train_time,
-                val_time=val_time,
-                epoch_time=epoch_time,
+                val_per_class=val_per_class,
                 qualitative_batch=qualitative_batch,
             )
 

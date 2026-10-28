@@ -63,14 +63,9 @@ class WandbLogger:
         if not self.is_active:
             return
 
-        # Se non viene passato uno step esplicito, usa epoch + 1.
-        # È importante che tutte le chiamate per la stessa epoch
-        # usino lo stesso step, e che solo l'ultima faccia commit=True.
         log_step = step if step is not None else epoch + 1
 
-        log_dict: dict[str, Any] = {
-            "epoch": epoch + 1,
-        }
+        log_dict: dict[str, Any] = {}
 
         if train_loss is not None:
             log_dict["train/loss"] = train_loss
@@ -84,7 +79,7 @@ class WandbLogger:
         if metrics:
             log_dict.update(
                 {
-                    f"val/{name}": value
+                    name if name.startswith("val/") else f"val/{name}": value
                     for name, value in metrics.items()
                 }
             )
