@@ -1,5 +1,6 @@
-experiment:
-  name: atlas120k_baseline
+# @package _global_
+
+name: atlas120k_baseline
 
 
 data:

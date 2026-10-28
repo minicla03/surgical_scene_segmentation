@@ -29,6 +29,8 @@ class DSADDataset(BaseSegmentationDataset):
     The target is binary:
         0 = background
         1 = target organ
+
+    Only the ``single_organ`` variant is currently supported.
     """
 
     VARIANT = "single_organ"
@@ -67,18 +69,11 @@ class DSADDataset(BaseSegmentationDataset):
         self,
         root: str,
         transform=None,
-        variant: str = "single_organ",
     ):
         super().__init__(root=root, transform=transform)
 
-        if variant != self.VARIANT:
-            raise ValueError(
-                f"Only variant='{self.VARIANT}' is currently supported. "
-                f"Got: '{variant}'"
-            )
-
         self.root = Path(root)
-        self.data_root = self.root / variant
+        self.data_root = self.root / self.VARIANT
 
         if not self.data_root.exists():
             raise FileNotFoundError(

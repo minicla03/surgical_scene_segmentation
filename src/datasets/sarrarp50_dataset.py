@@ -126,6 +126,35 @@ class SARRARP50Dataset(BaseSegmentationDataset):
     def __len__(self):
         return len(self.samples)
 
+    def _get_cap(self, video_path: Path) -> cv2.VideoCapture:
+        """Return a cached VideoCapture for *video_path*.
+
+        VideoCapture objects are opened once per worker and reused for all
+        subsequent frames of the same video.  Each DataLoader worker receives
+        its own forked copy of the dataset, so ``_cap_cache`` is process-local
+        and requires no locking.
+        """
+        if not hasattr(self, "_cap_cache"):
+            # Initialised lazily so that the dict is created *after* the
+            # DataLoader fork, guaranteeing each worker owns its captures.
+            self._cap_cache: dict[str, cv2.VideoCapture] = {}
+
+        key = str(video_path)
+        if key not in self._cap_cache:
+            cap = cv2.VideoCapture(key)
+            if not cap.isOpened():
+                raise RuntimeError(f"Unable to open video: {video_path}")
+            self._cap_cache[key] = cap
+
+        return self._cap_cache[key]
+
+    def __del__(self) -> None:
+        """Release all cached VideoCapture objects when the worker exits."""
+        if hasattr(self, "_cap_cache"):
+            for cap in self._cap_cache.values():
+                cap.release()
+            self._cap_cache.clear()
+
     def _load_sample(self, index):
 
         sample_info = self.samples[index]
@@ -138,19 +167,9 @@ class SARRARP50Dataset(BaseSegmentationDataset):
         # Load video frame
         # ---------------------------------------------------------
 
-        cap = cv2.VideoCapture(str(video_path))
-
-        if not cap.isOpened():
-            raise RuntimeError(
-                f"Unable to open video: {video_path}"
-            )
-
-        try:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
-
-            success, frame = cap.read()
-        finally:
-            cap.release()
+        cap = self._get_cap(video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+        success, frame = cap.read()
 
         if not success:
             raise RuntimeError(

@@ -1,19 +1,19 @@
-from monai.transforms import (
-    Compose,
-    EnsureChannelFirstd,
-    Resized,
-    RandFlipd,
-    RandRotated,
-    RandZoomd,
-    RandAdjustContrastd,
-    RandGaussianNoised,
+
+from monai.transforms.compose import Compose
+from monai.transforms.croppad.dictionary import RandSpatialCropd, SpatialPadd
+from monai.transforms.intensity.dictionary import (
+    RandGaussianSmoothd,
     ScaleIntensityd,
-    EnsureTyped,
 )
+from monai.transforms.spatial.dictionary import (
+    RandFlipd,
+    RandAffined,
+    Resized,
+)
+from monai.transforms.utility.dictionary import EnsureChannelFirstd, EnsureTyped
 
 
 class TransformFactory:
-
     def __init__(self, config):
         self.config = config
 
@@ -22,183 +22,103 @@ class TransformFactory:
     # =========================================================
 
     def build_train_transform(self):
-
         transforms = []
 
-        # -----------------------------------------------------
         # Preprocessing
-        # -----------------------------------------------------
+        transforms.extend(self._build_preprocessing())
 
-        transforms.extend(
-            self._build_preprocessing()
+        augmentation = self.config.get("augmentation", {}).get(
+            "train", {}
         )
 
-        # -----------------------------------------------------
-        # Augmentation
-        # -----------------------------------------------------
+        # Scaling
+        scaling = augmentation.get("scaling", {})
 
-        augmentation = (
-            self.config
-            .get("augmentation", {})
-            .get("train", {})
-        )
+        if scaling.get("enabled", False):
+            scale_range = scaling.get("range", [-0.1, 0.1])
+            scale_limit = max(
+                abs(scale_range[0]),
+                abs(scale_range[1]),
+            )
 
-        # -----------------------------------------------------
+            transforms.append(
+                RandAffined(
+                    keys=["image", "mask"],
+                    prob=scaling.get("probability", 1.0),
+                    scale_range=(scale_limit, scale_limit),
+                    mode=("bilinear", "nearest"),
+                    padding_mode="border",
+                )
+            )
+
+        # Gaussian blur
+        blur = augmentation.get("gaussian_blur", {})
+
+        if blur.get("enabled", False):
+            transforms.append(
+                RandGaussianSmoothd(
+                    keys=["image"],
+                    prob=blur.get("probability", 1.0),
+                    sigma_x=tuple(
+                        blur.get("sigma_x", [0.8, 1.4])
+                    ),
+                    sigma_y=tuple(
+                        blur.get("sigma_y", [0.8, 1.4])
+                    ),
+                )
+            )
+
         # Horizontal flip
-        # -----------------------------------------------------
-
         horizontal_flip = augmentation.get(
-            "horizontal_flip", {}
+            "horizontal_flip",
+            {},
         )
 
         if horizontal_flip.get("enabled", False):
-
             transforms.append(
                 RandFlipd(
                     keys=["image", "mask"],
                     prob=horizontal_flip.get(
                         "probability",
-                        horizontal_flip.get("p", 0.5)
+                        0.5,
                     ),
                     spatial_axis=1,
                 )
             )
 
-        # -----------------------------------------------------
-        # Vertical flip
-        # -----------------------------------------------------
+        # Random crop
+        crop = augmentation.get("random_crop", {})
 
-        vertical_flip = augmentation.get(
-            "vertical_flip", {}
-        )
+        if crop.get("enabled", False):
+            crop_size = tuple(
+                crop.get("size", [256, 256])
+            )
 
-        if vertical_flip.get("enabled", False):
-
+            # Image padding
             transforms.append(
-                RandFlipd(
-                    keys=["image", "mask"],
-                    prob=vertical_flip.get(
-                        "probability",
-                        vertical_flip.get("p", 0.5)
-                    ),
-                    spatial_axis=0,
-                )
-            )
-
-        # -----------------------------------------------------
-        # Rotation
-        # -----------------------------------------------------
-
-        rotation = augmentation.get(
-            "rotation",
-            augmentation.get("rotate", {})
-        )
-
-        if rotation.get("enabled", False):
-
-            # Config in degrees
-            range_degrees = rotation.get(
-                "range",
-                [-10, 10]
-            )
-
-            transforms.append(
-                RandRotated(
-                    keys=["image", "mask"],
-                    prob=rotation.get(
-                        "probability",
-                        rotation.get("p", 0.3)
-                    ),
-                    range_x=(
-                        range_degrees[0] * 3.141592653589793 / 180.0,
-                        range_degrees[1] * 3.141592653589793 / 180.0,
-                    ),
-                    mode=("bilinear", "nearest"),
-                )
-            )
-
-        # -----------------------------------------------------
-        # Zoom
-        # -----------------------------------------------------
-
-        zoom = augmentation.get(
-            "zoom",
-            {}
-        )
-
-        if zoom.get("enabled", False):
-
-            zoom_range = zoom.get(
-                "range",
-                [0.9, 1.1]
-            )
-
-            transforms.append(
-                RandZoomd(
-                    keys=["image", "mask"],
-                    prob=zoom.get(
-                        "probability",
-                        zoom.get("p", 0.3)
-                    ),
-                    min_zoom=zoom_range[0],
-                    max_zoom=zoom_range[1],
-                    mode=("bilinear", "nearest"),
-                )
-            )
-
-        # -----------------------------------------------------
-        # Contrast
-        # -----------------------------------------------------
-
-        contrast = augmentation.get(
-            "contrast",
-            {}
-        )
-
-        if contrast.get("enabled", False):
-
-            transforms.append(
-                RandAdjustContrastd(
+                SpatialPadd(
                     keys=["image"],
-                    prob=contrast.get(
-                        "probability",
-                        contrast.get("p", 0.3)
-                    ),
-                    gamma=tuple(
-                        contrast.get(
-                            "gamma",
-                            [0.8, 1.2]
-                        )
-                    ),
+                    spatial_size=crop_size,
+                    mode="edge",
                 )
             )
 
-        # -----------------------------------------------------
-        # Gaussian noise
-        # -----------------------------------------------------
-
-        gaussian_noise = augmentation.get(
-            "gaussian_noise",
-            {}
-        )
-
-        if gaussian_noise.get("enabled", False):
-
+            # Mask padding
             transforms.append(
-                RandGaussianNoised(
-                    keys=["image"],
-                    prob=gaussian_noise.get(
-                        "probability",
-                        gaussian_noise.get("p", 0.2)
-                    ),
-                    mean=gaussian_noise.get(
-                        "mean",
-                        0.0
-                    ),
-                    std=gaussian_noise.get(
-                        "std",
-                        0.01
-                    ),
+                SpatialPadd(
+                    keys=["mask"],
+                    spatial_size=crop_size,
+                    mode="constant",
+                    constant_values=0,
+                )
+            )
+
+            # Random crop
+            transforms.append(
+                RandSpatialCropd(
+                    keys=["image", "mask"],
+                    roi_size=crop_size,
+                    random_size=False,
                 )
             )
 
@@ -209,7 +129,6 @@ class TransformFactory:
     # =========================================================
 
     def build_val_transform(self):
-
         return Compose(
             self._build_preprocessing()
         )
@@ -219,7 +138,6 @@ class TransformFactory:
     # =========================================================
 
     def build_test_transform(self):
-
         return Compose(
             self._build_preprocessing()
         )
@@ -229,18 +147,14 @@ class TransformFactory:
     # =========================================================
 
     def _build_preprocessing(self):
-
         transforms = []
 
         preprocessing = self.config.get(
             "preprocessing",
-            {}
+            {},
         )
 
-        # -----------------------------------------------------
         # Channel first
-        # -----------------------------------------------------
-
         transforms.append(
             EnsureChannelFirstd(
                 keys=["image"],
@@ -255,17 +169,13 @@ class TransformFactory:
             )
         )
 
-        # -----------------------------------------------------
         # Resize
-        # -----------------------------------------------------
-
         image_cfg = preprocessing.get(
             "image",
-            {}
+            {},
         )
 
         if "size" in image_cfg:
-
             height, width = image_cfg["size"]
 
             transforms.append(
@@ -276,28 +186,46 @@ class TransformFactory:
                 )
             )
 
-        # -----------------------------------------------------
-        # Normalization
-        # -----------------------------------------------------
+        padding_cfg = preprocessing.get("padding", {})
 
-        if image_cfg.get(
-            "normalize",
-            False
-        ):
+        if padding_cfg.get("enabled", False):
+            height, width = image_cfg["size"]
+            divisor = padding_cfg.get("divisor", 16)
 
             transforms.append(
-                ScaleIntensityd(
+                SpatialPadd(
                     keys=["image"],
+                    spatial_size=(
+                        ((height + divisor - 1) // divisor) * divisor,
+                        ((width + divisor - 1) // divisor) * divisor,
+                    ),
+                    mode="edge",
                 )
             )
 
-        # -----------------------------------------------------
-        # Convert to tensors
-        # -----------------------------------------------------
+            transforms.append(
+                SpatialPadd(
+                    keys=["mask"],
+                    spatial_size=(
+                        ((height + divisor - 1) // divisor) * divisor,
+                        ((width + divisor - 1) // divisor) * divisor,
+                    ),
+                    mode="constant",
+                    constant_values=0,
+                )
+            )
+
+        # Normalize
+        if image_cfg.get("normalize", False):
+            transforms.append(
+                ScaleIntensityd(
+                    keys=["image"]
+                )
+            )
 
         transforms.append(
             EnsureTyped(
-                keys=["image", "mask"],
+                keys=["image", "mask"]
             )
         )
 

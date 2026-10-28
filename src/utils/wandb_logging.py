@@ -42,16 +42,13 @@ class WandbLogger:
         self,
         metrics: dict[str, Any],
         step: int | None = None,
+        commit: bool = False,
     ) -> None:
 
         if not self.is_active:
             return
 
-        wandb.log(metrics, step=step)
-
-    # ------------------------------------------------------------------
-    # Training / validation
-    # ------------------------------------------------------------------
+        wandb.log(metrics, step=step, commit=commit)
 
     def log_epoch_metrics(
         self,
@@ -60,13 +57,19 @@ class WandbLogger:
         val_loss: float | None = None,
         learning_rate: float | None = None,
         metrics: dict[str, float] | None = None,
+        step: int | None = None,
     ) -> None:
 
         if not self.is_active:
             return
 
+        # Se non viene passato uno step esplicito, usa epoch + 1.
+        # È importante che tutte le chiamate per la stessa epoch
+        # usino lo stesso step, e che solo l'ultima faccia commit=True.
+        log_step = step if step is not None else epoch + 1
+
         log_dict: dict[str, Any] = {
-            "epoch": epoch,
+            "epoch": epoch + 1,
         }
 
         if train_loss is not None:
@@ -86,27 +89,14 @@ class WandbLogger:
                 }
             )
 
-        wandb.log(log_dict, step=epoch)
-
-    # ------------------------------------------------------------------
-    # Test metrics
-    # ------------------------------------------------------------------
-
-    def log_test_metrics(
-        self,
-        metrics: dict[str, float],
-        prefix: str = "test",
-    ) -> None:
-
-        if not self.is_active:
-            return
-
-        log_dict = {
-            f"{prefix}/{name}": value
-            for name, value in metrics.items()
-        }
-
-        wandb.log(log_dict)
+        # commit=True: chiude lo step e lo rende visibile su W&B.
+        # Tutte le chiamate log_metrics precedenti per questa epoch
+        # devono usare commit=False e lo stesso step.
+        wandb.log(
+            log_dict,
+            step=log_step,
+            commit=True,
+        )
 
     # ------------------------------------------------------------------
     # Scenario / robustness evaluation
@@ -211,41 +201,15 @@ class WandbLogger:
         max_samples: int = 4,
         table_name: str = "qualitative/segmentation",
     ) -> None:
-        """Log qualitative segmentation predictions to W&B.
-
-        Args:
-            images:
-                Tensor with shape [B, C, H, W].
-
-            labels:
-                Ground-truth masks.
-
-            predictions:
-                Predicted masks.
-
-            class_labels:
-                Mapping from class index to class name.
-
-            scenario:
-                Evaluation scenario name.
-
-            epoch:
-                Current epoch.
-
-            max_samples:
-                Maximum number of samples to log.
-        """
 
         if not self.is_active:
             return
 
-        # Support [B, T, C, H, W]
         if images.ndim == 5:
             images = images.flatten(0, 1)
             labels = labels.flatten(0, 1)
             predictions = predictions.flatten(0, 1)
 
-        # Keep only RGB channels.
         if images.shape[1] > 3:
             images = images[:, :3]
 
@@ -261,6 +225,7 @@ class WandbLogger:
         n_samples = min(images.shape[0], max_samples)
 
         for index in range(n_samples):
+
             image = self._prepare_image(images[index])
 
             ground_truth = (
@@ -296,13 +261,17 @@ class WandbLogger:
             )
 
             table.add_data(
-                epoch,
+                epoch + 1 if epoch is not None else None,
                 scenario,
                 f"sample_{index}",
                 wandb_image,
             )
 
-        wandb.log({table_name: table})
+        wandb.log(
+            {table_name: table},
+            step=epoch + 1 if epoch is not None else None,
+            commit=False,
+        )
 
     def log_checkpoint(
         self,
@@ -414,48 +383,30 @@ class WandbLogger:
             allow_val_change=True,
         )
 
-    # ------------------------------------------------------------------
-    # Final results (train summary + test)
-    # ------------------------------------------------------------------
-
     def log_final_results(
         self,
         train_results: dict[str, Any],
         test_results: dict[str, float],
     ) -> None:
-        """Log a summary of the best training results and test metrics.
-
-        Args:
-            train_results:
-                Dictionary returned by Trainer.fit(), containing at
-                least 'best_epoch', 'best_val_metrics', 'history'.
-
-            test_results:
-                Dictionary returned by Evaluator.evaluate(), containing
-                at least 'loss', 'fps', and any configured metrics.
-        """
 
         if not self.is_active:
             return
 
         summary: dict[str, Any] = {}
 
-        # Best validation metrics (dynamic dict from Trainer)
         best_val = train_results.get("best_val_metrics", {})
+
         for key, value in best_val.items():
             summary[f"train/best_val_{key}"] = value
 
         summary["train/best_epoch"] = train_results.get(
-            "best_epoch", -1
+            "best_epoch",
+            -1,
         )
 
-        # Test metrics
         for key, value in test_results.items():
             summary[f"test/{key}"] = value
 
-        wandb.log(summary)
-
-        # Also set as W&B run summary (appears in the project table)
         if wandb.run is not None:
             for key, value in summary.items():
                 wandb.run.summary[key] = value

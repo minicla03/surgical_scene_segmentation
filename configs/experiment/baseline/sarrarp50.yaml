@@ -1,5 +1,7 @@
-experiment:
-  name: sarrarp50_baseline
+# @package _global_
+
+
+name: sarrarp50_baseline
 
 data:
   name: sarrarp50

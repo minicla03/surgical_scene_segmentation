@@ -33,6 +33,7 @@ class CholecSeg8kDataset(BaseSegmentationDataset):
     LABEL_MAP = {
         255: 0,   # Background
         50: 0,    # Background
+        0: 0,     # Background
         11: 1,    # Abdominal Wall
         21: 2,    # Liver
         13: 3,    # Gastrointestinal Tract
