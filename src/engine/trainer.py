@@ -24,8 +24,6 @@ class Trainer:
         device: torch.device,
         logger: Any | None = None,
     ) -> None:
-
-        
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -55,175 +53,203 @@ class Trainer:
         self.monitor = str(early_stopping_cfg.get("monitor", "dice"))
         self.monitor_mode = str(early_stopping_cfg.get("mode", "max")).lower()
 
-        if self.monitor_mode not in {"max", "min"}:
-            raise ValueError("Early stopping mode must be 'max' or 'min'.")
-
-        self.best_score = -float("inf") if self.monitor_mode == "max" else float("inf")
-        self.best_epoch = -1
-        self.best_checkpoint: str | None = None
-        self.epochs_without_improvement = 0
-        self.best_val_metrics: dict[str, float] = {}
+        if self.monitor_mode not in {"min", "max"}:
+            raise ValueError("early_stopping.mode must be either 'min' or 'max'")
 
         self.metric_names = list(self.metric_manager.names)
         available_metrics = set(self.metric_names) | {"loss", "fps"}
 
         if self.monitor not in available_metrics:
             raise ValueError(
-                f"Early-stopping monitor '{self.monitor}' is not available. "
+                f"Early stopping monitor '{self.monitor}' is not available. "
                 f"Available metrics: {sorted(available_metrics)}"
             )
 
-        self.history: dict[str, list[float]] = {
-            "train_loss": [],
-            "val_loss": [],
-            "val_fps": [],
-            "train_time": [],
-            "val_time": [],
-            "epoch_time": [],
-        }
+        self.best_score = float("inf") if self.monitor_mode == "min" else -float("inf")
+        self.best_epoch = 0
+        self.best_metrics: dict[str, float] = {}
+        self.epochs_without_improvement = 0
 
-        for metric_name in self.metric_names:
-            self.history[f"val_{metric_name}"] = []
+        self.output_dir = Path(cfg.get("output_dir", "./outputs"))
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.best_checkpoint_path = self.output_dir / "best.pt"
 
-    def _forward(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor]:
-        if hasattr(self.model, "is_mask2former") and self.model.is_mask2former:
-            output = self.model(x, y)
-            return None, output.loss
+    # Forward
+    def _forward(
+        self,
+        images: torch.Tensor,
+        masks: torch.Tensor | None = None,
+        training: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Forward pass.
+        Returns:
+            logits/predictions,
+            loss
+        """
+        # Mask2Former
+        if getattr(self.model, "is_mask2former", False):
+            if training:
+                outputs = self.model(pixel_values=images, labels=masks)
+                loss = getattr(outputs, "loss", None)
 
-        output = self.model(x)
+                if loss is None:
+                    raise RuntimeError("Mask2Former did not return a training loss.")
 
-        if isinstance(output, (list, tuple)):
-            losses = []
-            for logits in output:
-                target = y.unsqueeze(1) if y.ndim == 3 else y
-                losses.append(self.loss_fn(logits, target))
-            
-            loss = sum(losses) / len(losses)
-            logits = output[0]
-        else:
-            logits = output
-            if y.ndim == 3:
-                y = y.unsqueeze(1)
-            loss = self.loss_fn(logits, y)
+                logits = getattr(outputs, "logits", None)
+                if logits is None:
+                    raise RuntimeError("Mask2Former did not return logits.")
+
+                return logits, loss
+
+            outputs = self.model(pixel_values=images)
+            logits = getattr(outputs, "logits", None)
+
+            if logits is None:
+                raise RuntimeError("Mask2Former did not return logits.")
+
+            return logits, None
+
+        # Standard segmentation model
+        logits = self.model(images)
+        loss = None
+        if masks is not None:
+            loss = self.loss_fn(logits, masks)
 
         return logits, loss
 
-    def _prepare_batch(self, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-        x = batch["image"].to(self.device, non_blocking=True)
-        y = batch["mask"].to(self.device, non_blocking=True)
+    # Batch preparation
+    def _prepare_batch(
+        self,
+        batch: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        images = batch["image"].to(self.device, non_blocking=True)
+        masks = batch["mask"].to(self.device, non_blocking=True)
+        return images, masks
 
-        if y.ndim == 4 and y.shape[1] == 1:
-            y = y[:, 0]
-        y = y.long()
-
-        return x, y
-
+    # AMP
     def _autocast(self):
-        enabled = self.scaler is not None and self.device.type == "cuda"
-        return torch.amp.autocast("cuda", enabled=enabled)
+        precision = str(self.cfg.train.get("precision", "32"))
+        enabled = precision == "16-mixed" and self.device.type == "cuda"
+        return torch.amp.autocast(device_type="cuda", enabled=enabled)
 
-    def train_epoch(self, epoch: int) -> tuple[float, float]:
+    # Training
+    def train_epoch(
+        self,
+        epoch: int,
+    ) -> dict[str, float]:
         self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
-        losses: list[float] = []
-        grad_norms: list[float] = []
-        progress = tqdm(self.train_loader, desc=f"Train [{epoch + 1}/{self.max_epochs}]")
-        num_steps = len(self.train_loader)
+        total_loss = 0.0
+        num_batches = 0
 
-        for step, batch in enumerate(progress):
-            x, y = self._prepare_batch(batch)
+        self.optimizer.zero_grad(set_to_none=True)
+        progress = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]", leave=False)
+
+        for batch_idx, batch in enumerate(progress):
+            images, masks = self._prepare_batch(batch)
 
             with self._autocast():
-                _, loss = self._forward(x, y)
+                _, loss = self._forward(images, masks, training=True)
 
-            real_loss = float(loss.detach().item())
-            losses.append(real_loss)
-            scaled_loss = loss / self.accumulation_steps
+                if loss is None:
+                    raise RuntimeError("Training loss is None.")
+
+                loss_for_backward = loss / self.accumulation_steps
 
             if self.scaler is not None:
-                self.scaler.scale(scaled_loss).backward()
+                self.scaler.scale(loss_for_backward).backward()
             else:
-                scaled_loss.backward()
+                loss_for_backward.backward()
 
-            is_update_step = (step + 1) % self.accumulation_steps == 0 or (step + 1) == num_steps
+            should_update = (batch_idx + 1) % self.accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader)
 
-            if is_update_step:
-                # Unscale prima di calcolare la norma del gradiente
+            if should_update:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
 
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), max_norm=float("inf")
-                ).item()
-                if np.isfinite(grad_norm):
-                    grad_norms.append(grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     self.optimizer.step()
+
                 self.optimizer.zero_grad(set_to_none=True)
 
-            progress.set_postfix(loss=f"{real_loss:.4f}")
-
-        return self._safe_mean(losses), self._safe_mean(grad_norms)
-
-    @torch.inference_mode()
-    def validate(self, epoch: int) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
-        self.model.eval()
-        total_images = 0
-        total_model_time = 0.0
-        total_loss = 0.0
-        num_batches = 0
-        self.metric_manager.reset()
-
-        progress = tqdm(self.val_loader, desc=f"Val   [{epoch + 1}/{self.max_epochs}]")
-        qualitative_batch = None
-        collect_qualitative = self.qualitative_enabled and (epoch == 0 or (epoch + 1) % self.qualitative_freq == 0)
-
-        for batch in progress:
-            x, y = self._prepare_batch(batch)
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
-
-            start_time = time.perf_counter()
-
-            with self._autocast():
-                logits, loss = self._forward(x, y)
-
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
-
-            total_model_time += time.perf_counter() - start_time
-            total_loss += float(loss.detach().item())
+            loss_value = float(loss.detach().item())
+            total_loss += loss_value
             num_batches += 1
 
-            self.metric_manager.update(logits, y)
-            total_images += int(x.shape[0])
-            progress.set_postfix(loss=f"{loss.item():.4f}")
+            progress.set_postfix(loss=f"{loss_value:.4f}")
 
-            if collect_qualitative and qualitative_batch is None and logits is not None:
-                predictions = torch.argmax(logits, dim=1)
-                qualitative_batch = {
-                    "images": x[: self.qualitative_max_samples].detach().cpu(),
-                    "labels": y[: self.qualitative_max_samples].detach().cpu(),
-                    "predictions": predictions[: self.qualitative_max_samples].detach().cpu(),
-                }
+        return {"loss": total_loss / max(num_batches, 1)}
+
+    # Validation
+    def validate(
+        self,
+        epoch: int,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, torch.Tensor] | None]:
+        self.model.eval()
+        self.metric_manager.reset()
+        total_loss = 0.0
+        num_batches = 0
+        total_images = 0
+        total_model_time = 0.0
+        qualitative_batch = None
+
+        progress = tqdm(self.val_loader, desc=f"Epoch {epoch} [Val]", leave=False)
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(progress):
+                images, masks = self._prepare_batch(batch)
+
+                if self.qualitative_enabled and qualitative_batch is None and batch_idx == 0:
+                    max_samples = min(self.qualitative_max_samples, images.shape[0])
+                    qualitative_batch = {
+                        "image": images[:max_samples].detach().cpu(),
+                        "mask": masks[:max_samples].detach().cpu(),
+                    }
+
+                start_time = time.perf_counter()
+
+                with self._autocast():
+                    logits, model_loss = self._forward(images, masks, training=False)
+
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+
+                elapsed = time.perf_counter() - start_time
+                total_model_time += elapsed
+                total_images += images.shape[0]
+
+                # Standard models compute validation loss here.
+                # Mask2Former may already provide it.
+                loss = model_loss
+                if loss is None:
+                    loss = self.loss_fn(logits, masks)
+
+                total_loss += float(loss.detach().item())
+                num_batches += 1
+
+                self.metric_manager.update(logits, masks)
 
         results = self.metric_manager.compute()
         per_class_results = self.metric_manager.compute_per_class()
+
         results["loss"] = total_loss / max(num_batches, 1)
         results["fps"] = total_images / max(total_model_time, 1e-8)
         results = {key: float(value) for key, value in results.items()}
 
         return results, per_class_results, qualitative_batch
 
-    def _save_checkpoint(self, epoch: int) -> str:
-        output_dir = Path(self.cfg.paths.checkpoint)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = output_dir / "best.pt"
-
+    # Checkpoint
+    def _save_checkpoint(
+        self,
+        path: Path,
+        epoch: int,
+        metrics: dict[str, float],
+    ) -> None:
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
@@ -231,210 +257,197 @@ class Trainer:
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
             "best_score": self.best_score,
             "best_epoch": self.best_epoch,
-            "best_val_metrics": self.best_val_metrics,
+            "best_metrics": self.best_metrics,
+            "metrics": metrics,
             "config": self.cfg,
         }
 
-        temporary_path = checkpoint_path.with_suffix(".tmp")
-        torch.save(checkpoint, temporary_path)
-        temporary_path.replace(checkpoint_path)
+        if self.scaler is not None:
+            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
 
-        if self.logger is not None:
-            self.logger.log_checkpoint(
-                checkpoint_path=str(checkpoint_path),
-                name=f"{self.cfg.data.name}-{self.cfg.model.name}",
-                aliases=["best"],
+        torch.save(checkpoint, path)
+
+    # Early stopping
+    def _is_improvement(self, score: float) -> bool:
+        if self.monitor_mode == "min":
+            return score < self.best_score
+        return score > self.best_score
+
+    def _update_best(
+        self,
+        epoch: int,
+        metrics: dict[str, float],
+    ) -> bool:
+        if self.monitor not in metrics:
+            raise KeyError(
+                f"Monitor metric '{self.monitor}' not found in validation metrics: "
+                f"{list(metrics.keys())}"
             )
 
-        return str(checkpoint_path)
+        score = float(metrics[self.monitor])
 
-    def _is_improvement(self, score: float) -> bool:
-        if np.isnan(score):
-            return False
-        if self.monitor_mode == "max":
-            return score > self.best_score
-        return score < self.best_score
-
-    def _update_best(self, epoch: int, val_metrics: dict[str, float]) -> bool:
-        score = val_metrics.get(self.monitor, float("nan"))
-        if not self._is_improvement(score):
+        if not np.isfinite(score) or not self._is_improvement(score):
             return False
 
         self.best_score = score
         self.best_epoch = epoch
+        self.best_metrics = dict(metrics)
+
+        self._save_checkpoint(self.best_checkpoint_path, epoch, metrics)
         self.epochs_without_improvement = 0
-        self.best_val_metrics = dict(val_metrics)
-        self.best_checkpoint = self._save_checkpoint(epoch)
+
         return True
 
+    # Logging
     def _log_epoch(
         self,
         epoch: int,
-        train_loss: float,
+        train_metrics: dict[str, float],
         val_metrics: dict[str, float],
-        val_per_class: dict[str, float],
+        per_class_results: dict[str, float],
         qualitative_batch: dict[str, torch.Tensor] | None,
     ) -> None:
         if self.logger is None:
             return
 
-        wandb_step = epoch + 1
+        metrics = {}
+        for key, value in train_metrics.items():
+            metrics[f"train/{key}"] = value
 
-        if qualitative_batch is not None:
-            num_classes = int(self.cfg.data.num_classes)
-            class_labels = {index: f"class_{index}" for index in range(num_classes)}
-            configured_labels = self.cfg.data.get("classes", self.cfg.data.get("class_labels", None))
+        for key, value in val_metrics.items():
+            metrics[f"val/{key}"] = value
 
-            if configured_labels is not None:
-                if isinstance(configured_labels, dict):
-                    class_labels = {int(key): str(value) for key, value in configured_labels.items()}
-                elif isinstance(configured_labels, (list, tuple)):
-                    class_labels = {index: str(name) for index, name in enumerate(configured_labels)}
+        for key, value in per_class_results.items():
+            metrics[f"val/{key}"] = value
 
-            self.logger.log_qualitative_masks(
-                images=qualitative_batch["images"],
-                labels=qualitative_batch["labels"],
-                predictions=qualitative_batch["predictions"],
-                class_labels=class_labels,
-                scenario="clean",
-                epoch=epoch,
-                max_samples=self.qualitative_max_samples,
-            )
+        metrics["epoch"] = epoch
 
-        log_metrics = {"fps": val_metrics["fps"]}
-        for metric_name in self.metric_names:
-            log_metrics[metric_name] = val_metrics.get(metric_name, float("nan"))
-        if val_per_class:
-            log_metrics.update(val_per_class)
+        if self.scheduler is not None:
+            try:
+                metrics["learning_rate"] = self.optimizer.param_groups[0]["lr"]
+            except Exception:
+                pass
 
-        self.logger.log_epoch_metrics(
-            epoch=epoch,
-            train_loss=train_loss,
-            val_loss=val_metrics["loss"],
-            learning_rate=self.optimizer.param_groups[0]["lr"],
-            metrics=log_metrics,
-            step=wandb_step,
+        self.logger.log(metrics, step=epoch)
+
+        # Per-class metric names
+        num_classes = int(self.cfg.data.num_classes)
+        class_labels = {index: f"class_{index}" for index in range(num_classes)}
+        configured_labels = self.cfg.data.get("classes", self.cfg.data.get("class_labels", None))
+
+        if configured_labels is not None:
+            if isinstance(configured_labels, dict):
+                class_labels = {int(key): str(value) for key, value in configured_labels.items()}
+            elif isinstance(configured_labels, (list, tuple)):
+                class_labels = {index: str(name) for index, name in enumerate(configured_labels)}
+
+        # Qualitative logging
+        if not self.qualitative_enabled or qualitative_batch is None or epoch % self.qualitative_freq != 0:
+            return
+
+        images = qualitative_batch["image"]
+        masks = qualitative_batch["mask"]
+
+        with torch.no_grad():
+            with self._autocast():
+                logits, _ = self._forward(
+                    images.to(self.device),
+                    masks.to(self.device),
+                    training=False,
+                )
+
+        predictions = torch.argmax(logits, dim=1).detach().cpu()
+        images = images.detach().cpu()
+        masks = masks.detach().cpu()
+
+        self.logger.log_qualitative(
+            images=images,
+            masks=masks,
+            predictions=predictions,
+            class_labels=class_labels,
+            step=epoch,
         )
 
+    # Training loop
     def fit(self) -> dict[str, Any]:
-        print("\n" + "=" * 60)
-        print("TRAINING")
-        print("=" * 60)
+        history: list[dict[str, Any]] = []
 
-        training_start = time.perf_counter()
-
-        for epoch in range(self.max_epochs):
+        for epoch in range(1, self.max_epochs + 1):
             epoch_start = time.perf_counter()
-            print(f"\nEpoch {epoch + 1}/{self.max_epochs}")
+            train_metrics = self.train_epoch(epoch)
 
-            train_start = time.perf_counter()
-            train_loss, grad_norm = self.train_epoch(epoch)
-            train_time = time.perf_counter() - train_start
-
+            # Scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            self.history["train_loss"].append(train_loss)
-            self.history["train_time"].append(train_time)
+            # Validation
+            if epoch % self.eval_freq == 0:
+                val_metrics, per_class_results, qualitative_batch = self.validate(epoch)
 
-            should_validate = (epoch == 0) or ((epoch + 1) % self.eval_freq == 0) or ((epoch + 1) == self.max_epochs)
+                self._log_epoch(
+                    epoch=epoch,
+                    train_metrics=train_metrics,
+                    val_metrics=val_metrics,
+                    per_class_results=per_class_results,
+                    qualitative_batch=qualitative_batch,
+                )
 
-            if not should_validate:
+                improved = self._update_best(epoch, val_metrics)
+
+                if not improved:
+                    self.epochs_without_improvement += 1
+
                 epoch_time = time.perf_counter() - epoch_start
-                self.history["epoch_time"].append(epoch_time)
-                print(f"Train Loss : {train_loss:.4f}")
-                if self.logger is not None:
-                    self.logger.log_epoch_metrics(
-                        epoch=epoch,
-                        train_loss=train_loss,
-                        learning_rate=self.optimizer.param_groups[0]["lr"],
-                        step=epoch + 1,
-                    )
-                continue
+                epoch_results = {
+                    "epoch": epoch,
+                    "train": train_metrics,
+                    "val": val_metrics,
+                    "per_class": per_class_results,
+                    "epoch_time": epoch_time,
+                }
+                history.append(epoch_results)
 
-            val_start = time.perf_counter()
-            val_metrics, val_per_class, qualitative_batch = self.validate(epoch)
-            val_time = time.perf_counter() - val_start
-            epoch_time = time.perf_counter() - epoch_start
+                print(
+                    f"[Epoch {epoch:03d}] "
+                    f"train_loss={train_metrics.get('loss', float('nan')):.4f} "
+                    f"val_loss={val_metrics.get('loss', float('nan')):.4f} "
+                    f"{self.monitor}={val_metrics.get(self.monitor, float('nan')):.4f}"
+                )
 
-            self.history["val_loss"].append(val_metrics["loss"])
-            self.history["val_fps"].append(val_metrics["fps"])
-            self.history["val_time"].append(val_time)
-            self.history["epoch_time"].append(epoch_time)
+                if improved:
+                    print(f"  -> New best checkpoint ({self.monitor}={self.best_score:.4f})")
 
-            for metric_name in self.metric_names:
-                self.history[f"val_{metric_name}"].append(val_metrics.get(metric_name, float("nan")))
+                # Early stopping
+                if self.early_stopping_enabled and self.epochs_without_improvement >= self.patience:
+                    print("Early stopping triggered.")
+                    break
 
-            improved = self._update_best(epoch, val_metrics)
-
-            if improved:
-                print(f"✓ New best {self.monitor}: {self.best_score:.4f}")
             else:
-                self.epochs_without_improvement += 1
-                print(f"No improvement ({self.epochs_without_improvement}/{self.patience})")
-
-            self._log_epoch(
-                epoch=epoch,
-                train_loss=train_loss,
-                val_metrics=val_metrics,
-                val_per_class=val_per_class,
-                qualitative_batch=qualitative_batch,
-            )
-
-            print(f"Train Loss : {train_loss:.4f}")
-            print(f"Val Loss   : {val_metrics['loss']:.4f}")
-            print(f"Val FPS    : {val_metrics['fps']:.2f}")
-            print(f"Train Time : {train_time:.2f}s")
-            print(f"Val Time   : {val_time:.2f}s")
-            print(f"Epoch Time : {epoch_time:.2f}s")
-
-            for metric_name in self.metric_names:
-                value = val_metrics.get(metric_name, float("nan"))
-                label = f"Val {metric_name.upper():<8}"
-                if np.isnan(value):
-                    print(f"{label}: N/A")
-                else:
-                    print(f"{label}: {value:.4f}")
-
-            if self.early_stopping_enabled and self.epochs_without_improvement >= self.patience:
-                print("\nEarly stopping.")
-                break
-
-        total_training_time = time.perf_counter() - training_start
-
-        if self.best_checkpoint is None:
-            raise RuntimeError("Training finished without creating a valid checkpoint.")
-
-        if self.logger is not None:
-            self.logger.log_metrics(
-                {
-                    "training/total_time_seconds": total_training_time,
-                    "training/completed_epochs": len(self.history["train_loss"]),
-                    "training/best_epoch": self.best_epoch + 1,
-                    "training/best_score": self.best_score,
-                },
-                step=self.best_epoch + 1 if self.best_epoch >= 0 else 1,
-                commit=True,
-            )
-
-        print("\n" + "=" * 60)
-        print("TRAINING FINISHED")
-        print("=" * 60)
-        print(f"Best epoch : {self.best_epoch + 1}")
-        print(f"Best {self.monitor}: {self.best_score:.4f}")
-        print(f"Checkpoint : {self.best_checkpoint}")
-        print(f"Total time : {total_training_time:.2f}s")
-        print("=" * 60)
+                epoch_time = time.perf_counter() - epoch_start
+                epoch_results = {
+                    "epoch": epoch,
+                    "train": train_metrics,
+                    "epoch_time": epoch_time,
+                }
+                history.append(epoch_results)
 
         return {
-            "best_checkpoint": self.best_checkpoint,
+            "history": history,
             "best_epoch": self.best_epoch,
-            "best_val_metrics": self.best_val_metrics,
-            "history": self.history,
+            "best_score": self.best_score,
+            "best_metrics": self.best_metrics,
+            "best_checkpoint": str(self.best_checkpoint_path),
         }
 
+    # Utilities
     @staticmethod
     def _safe_mean(values: list[float]) -> float:
         if not values:
-            return float("nan")
-        return float(np.mean(values))
+            return 0.0
+
+        finite_values = [value for value in values if np.isfinite(value)]
+
+        if not finite_values:
+            return 0.0
+
+        return float(np.mean(finite_values))

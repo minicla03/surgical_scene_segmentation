@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import time
+
 import hydra
 import torch
-from omegaconf import DictConfig, OmegaConf
 from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from src.engine.trainer import Trainer
-#from src.engine.evaluator import Evaluator
-from src.utils.repro import set_seed, seed_worker
-from src.utils.wandb_logging import WandbLogger
 from src.datasets.transformation.factory import TransformFactory
 from src.datasets.transformation.transform_dataset import TransformDataset
+from src.engine.tester import Tester
+from src.engine.trainer import Trainer
 from src.metrics.metric_manager import MetricManager
+from src.utils.repro import seed_worker, set_seed
+from src.utils.wandb_logging import WandbLogger
+
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     experiment_start = time.time()
+    logger = None
 
     def log_step(step, message):
         elapsed = time.time() - experiment_start
@@ -32,16 +35,22 @@ def main(cfg: DictConfig):
     print("=" * 60, flush=True)
 
     try:
+        # ==============================================================
+        # 1. Setup
+        # ==============================================================
         log_step(1, "Setting random seed...")
-        
         set_seed(cfg.experiment.seed)
+
         generator = torch.Generator()
         generator.manual_seed(cfg.experiment.seed)
+
         device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
         log_step(1, f"Setup completed. Device: {device}")
 
+        # ==============================================================
+        # 2. WandB
+        # ==============================================================
         log_step(2, "Initializing WandB logger...")
-
         logger = WandbLogger(
             enabled=cfg.logging.wandb.enabled,
             project=cfg.logging.wandb.project,
@@ -52,77 +61,65 @@ def main(cfg: DictConfig):
         )
         log_step(2, "WandB logger initialized.")
 
+        # ==============================================================
+        # 3. Dataset
+        # ==============================================================
         log_step(3, "Instantiating dataset...")
         dataset = instantiate(cfg.data.dataset)
-
         log_step(3, "Dataset instantiated.")
 
+        # --------------------------------------------------------------
+        # Dataset split
+        # --------------------------------------------------------------
         log_step(3, "Creating train/validation/test split...")
-
         split_cfg = cfg.data.split
-
         split_kwargs = {
             "strategy": split_cfg.strategy,
             "group_by": split_cfg.group_by,
         }
 
         if split_cfg.strategy == "percentage":
-            split_kwargs.update(
-                {
-                    "train_ratio": split_cfg.train_ratio,
-                    "val_ratio": split_cfg.val_ratio,
-                    "test_ratio": split_cfg.test_ratio,
-                    "seed": split_cfg.get(
-                        "seed",
-                        cfg.experiment.seed,
-                    ),
-                    "stratified": split_cfg.get(
-                        "stratified",
-                        False,
-                    ),
-                }
-            )
+            split_kwargs.update({
+                "train_ratio": split_cfg.train_ratio,
+                "val_ratio": split_cfg.val_ratio,
+                "test_ratio": split_cfg.test_ratio,
+                "seed": split_cfg.get("seed", cfg.experiment.seed),
+                "stratified": split_cfg.get("stratified", False),
+            })
 
         train_dataset, val_dataset, test_dataset = dataset.create_split(**split_kwargs)
-
         log_step(3, "Dataset split completed.")
 
+        # ==============================================================
+        # 4. Transforms
+        # ==============================================================
         log_step(4, "Building transforms...")
         transform_factory = TransformFactory(cfg)
+
         train_transform = transform_factory.build_train_transform()
         val_transform = transform_factory.build_val_transform()
         test_transform = transform_factory.build_test_transform() if test_dataset is not None else None
         log_step(4, "Transforms built.")
 
+        # ==============================================================
+        # 5. TransformDataset
+        # ==============================================================
         log_step(5, "Wrapping datasets with TransformDataset...")
-        
         if train_dataset is not None:
-            train_dataset = TransformDataset(
-                train_dataset,
-                transform=train_transform,
-            )
-
+            train_dataset = TransformDataset(train_dataset, transform=train_transform)
         if val_dataset is not None:
-            val_dataset = TransformDataset(
-                val_dataset,
-                transform=val_transform,
-            )
-
+            val_dataset = TransformDataset(val_dataset, transform=val_transform)
         if test_dataset is not None:
-            test_dataset = TransformDataset(
-                test_dataset,
-                transform=test_transform,
-            )
-
+            test_dataset = TransformDataset(test_dataset, transform=test_transform)
         log_step(5, "Datasets wrapped.")
 
+        # ==============================================================
+        # 6. DataLoaders
+        # ==============================================================
         log_step(6, "Creating DataLoaders...")
-        train_loader = None
-        val_loader = None
-        test_loader = None
+        train_loader, val_loader, test_loader = None, None, None
 
         if train_dataset is not None:
-
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=cfg.train.batch_size,
@@ -132,9 +129,9 @@ def main(cfg: DictConfig):
                 worker_init_fn=seed_worker,
                 generator=generator,
             )
+            print(f"           Train batches: {len(train_loader)}", flush=True)
 
         if val_dataset is not None:
-
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=cfg.train.batch_size,
@@ -144,9 +141,9 @@ def main(cfg: DictConfig):
                 worker_init_fn=seed_worker,
                 generator=generator,
             )
+            print(f"           Val batches  : {len(val_loader)}", flush=True)
 
         if test_dataset is not None:
-
             test_loader = DataLoader(
                 test_dataset,
                 batch_size=cfg.train.batch_size,
@@ -156,39 +153,41 @@ def main(cfg: DictConfig):
                 worker_init_fn=seed_worker,
                 generator=generator,
             )
+            print(f"           Test batches : {len(test_loader)}", flush=True)
+        else:
+            print("           Test loader  : disabled", flush=True)
         log_step(6, "DataLoaders created.")
 
-        if train_loader is not None:
-            print(f"           Train batches: {len(train_loader)}", flush=True)
-        if val_loader is not None:
-            print(f"           Val batches  : {len(val_loader)}", flush=True)
-        if test_loader is not None:
-            print(f"           Test batches : {len(test_loader)}", flush=True)
-
+        # ==============================================================
+        # 7. Model
+        # ==============================================================
         log_step(7, "Building model...")
         model = instantiate(cfg.model.architecture).to(device)
         log_step(7, "Model initialized.")
+        
         logger.log_model_info(model, model_name=cfg.model.name)
 
+        # ==============================================================
+        # 8. Optimizer, scheduler, loss
+        # ==============================================================
         log_step(8, "Building optimizer, scheduler, loss...")
         optimizer = instantiate(cfg.train.optimizer, params=model.parameters())
         scheduler = instantiate(cfg.train.scheduler, optimizer=optimizer)
         loss_fn = instantiate(cfg.train.loss)
         log_step(8, "Optimization components initialized.")
 
+        # ==============================================================
+        # 9. AMP scaler
+        # ==============================================================
         log_step(9, "Initializing AMP scaler...")
-        scaler = None
-
-        if "scaler" in cfg.train:
-            scaler = instantiate(cfg.train.scaler)
-        
+        scaler = instantiate(cfg.train.scaler) if "scaler" in cfg.train else None
         log_step(9, "AMP scaler initialized.")
 
+        # ==============================================================
+        # 10. Metrics
+        # ==============================================================
         log_step(10, "Initializing metrics...")
-        metrics = {
-            name: instantiate(metric_cfg)
-            for name, metric_cfg in cfg.evaluation.metrics.items()
-        }
+        metrics = {name: instantiate(metric_cfg) for name, metric_cfg in cfg.evaluation.metrics.items()}
 
         if hasattr(dataset, "CLASS_NAMES"):
             class_names = {i: name for i, name in enumerate(dataset.CLASS_NAMES)}
@@ -196,16 +195,17 @@ def main(cfg: DictConfig):
             raise ValueError(f"CLASS_NAMES attribute is missing in dataset {cfg.data.name}")
 
         num_classes = dataset.num_classes
-        
         metric_manager = MetricManager(
             metrics=metrics,
             num_classes=num_classes,
             dataset_name=cfg.data.name,
             class_names=class_names,
         )
-
         log_step(10, "Metrics initialized.")
 
+        # ==============================================================
+        # 11. Trainer
+        # ==============================================================
         log_step(11, "Initializing Trainer...")
         trainer = Trainer(
             model=model,
@@ -222,60 +222,84 @@ def main(cfg: DictConfig):
         )
         log_step(11, "Trainer initialized.")
 
+        # ==============================================================
+        # 12. Training
+        # ==============================================================
         log_step(12, "Starting training...")
         train_results = trainer.fit()
         log_step(12, "Training completed.")
 
+        # ==============================================================
+        # 13. Load best checkpoint
+        # ==============================================================
         log_step(13, "Loading best checkpoint...")
         checkpoint = torch.load(train_results["best_checkpoint"], map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         log_step(13, "Best checkpoint loaded.")
 
+        # ==============================================================
+        # 14. Optional final test
+        # ==============================================================
+        test_results = {}
 
-        #if test_loader is not None:
-        #
-        #     log_step(14, "Starting final test evaluation...")
-        #
-        #     test_metrics = MetricManager(
-        #         metrics={
-        #             name: instantiate(metric_cfg)
-        #             for name, metric_cfg
-        #             in cfg.evaluation.metrics.items()
-        #         },
-        #         num_classes=cfg.data.num_classes,
-        #         dataset_name=cfg.data.name,
-        #         class_names=class_names,
-        #     )
-        #
-        #     evaluator = Evaluator(
-        #         model=model,
-        #         data_loader=test_loader,
-        #         metric_manager=test_metrics,
-        #         device=device,
-        #     )
-        #
-        #     test_results = evaluator.evaluate()
-        #
-        #     logger.log_final_results(
-        #         train_results,
-        #         test_results,
-        #     )
-        #
-        #     log_step(14, "Final test evaluation completed.")
+        if test_loader is not None:
+            log_step(14, "Starting final test evaluation...")
 
-        log_step(14, "Logging final results...")
-        logger.log_final_results(train_results, {})
-        log_step(14, "Experiment completed.")
+            # ----------------------------------------------------------
+            # IMPORTANT: Use a fresh MetricManager for the test set.
+            # ----------------------------------------------------------
+            test_metrics = {name: instantiate(metric_cfg) for name, metric_cfg in cfg.evaluation.metrics.items()}
+            test_metric_manager = MetricManager(
+                metrics=test_metrics,
+                num_classes=num_classes,
+                dataset_name=cfg.data.name,
+                class_names=class_names,
+            )
+
+            tester = Tester(
+                model=model,
+                test_loader=test_loader,
+                metric_manager=test_metric_manager,
+                loss_fn=loss_fn,
+                cfg=cfg,
+                device=device,
+                logger=logger,
+            )
+
+            test_results = tester.test()
+            log_step(14, "Final test evaluation completed.")
+        else:
+            print("\nTest evaluation skipped: no test dataset available.", flush=True)
+
+        # ==============================================================
+        # 15. Final results
+        # ==============================================================
+        log_step(15, "Logging final results...")
+        logger.log_final_results(train_results, test_results)
+        log_step(15, "Experiment completed.")
+
+        # ==============================================================
+        # Final summary
+        # ==============================================================
+        print("\n" + "=" * 60, flush=True)
+
+        if test_results:
+            print("FINAL TEST RESULTS", flush=True)
+            print("=" * 60, flush=True)
+
+            for name, value in test_results.get("metrics", {}).items():
+                print(f"{name:20s}: {value:.4f}", flush=True)
+        else:
+            print("TEST EVALUATION NOT AVAILABLE", flush=True)
+
+        print("=" * 60, flush=True)
 
     finally:
-        logger.finish()
+        if logger is not None:
+            logger.finish()
+
         elapsed = time.time() - experiment_start
         print(f"\nTotal execution time: {elapsed:.2f}s", flush=True)
-
-    print("\n" + "=" * 60, flush=True)
-    print("FINAL TEST RESULTS", flush=True)
-    print("=" * 60, flush=True)
-    print("=" * 60, flush=True)
 
 
 if __name__ == "__main__":
