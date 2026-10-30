@@ -33,6 +33,7 @@ def main(cfg: DictConfig):
 
     try:
         log_step(1, "Setting random seed...")
+        
         set_seed(cfg.experiment.seed)
         generator = torch.Generator()
         generator.manual_seed(cfg.experiment.seed)
@@ -95,8 +96,6 @@ def main(cfg: DictConfig):
 
         log_step(5, "Wrapping datasets with TransformDataset...")
         
-        log_step(5, "Wrapping datasets with TransformDataset...")
-
         if train_dataset is not None:
             train_dataset = TransformDataset(
                 train_dataset,
