@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
+from torch.utils.data import Subset
 
 from src.datasets.base_dataset import BaseSegmentationDataset
 
@@ -21,36 +22,16 @@ class SARRARP50Dataset(BaseSegmentationDataset):
         │   │   ├── video_left.avi
         │   │   └── segmentation/
         │   │       ├── 000001.png
-        │   │       ├── 000002.png
         │   │       └── ...
         │   └── ...
-        │
         ├── val/
         │   └── ...
-        │
         └── test/
             └── ...
 
-    Each sample is defined by a segmentation mask:
-
-        video_xx/segmentation/<frame_id>.png
-
-    The corresponding RGB frame is extracted on-demand from:
-
-        video_xx/video_left.avi
-
-    Public interface
-    ----------------
-    The dataset is instantiated without a split:
-
-        dataset = SARRARP50Dataset(root=...)
-
-    The official train/val/test datasets are then created with:
-
-        train_ds, val_ds, test_ds = dataset.create_official_split()
+    The dataset is instantiated without a split. The official
+    train/validation/test datasets are created through create_split().
     """
-
-    NUM_CLASSES = 10
 
     CLASS_NAMES = [
         "Background",
@@ -65,11 +46,21 @@ class SARRARP50Dataset(BaseSegmentationDataset):
         "Catheter",
     ]
 
-    VALID_SPLITS = {"train", "val", "test"}
+    VALID_SPLITS = {
+        "train",
+        "val",
+        "test",
+    }
+
+    SPLIT_NAMES = {
+        "train": "train",
+        "validation": "val",
+        "test": "test",
+    }
 
     def __init__(
         self,
-        root,
+        root: str,
         split: Optional[str] = None,
         transform=None,
         preload_metadata: bool = True,
@@ -81,28 +72,14 @@ class SARRARP50Dataset(BaseSegmentationDataset):
 
         self.root = Path(root)
         self.split = split
-        self.transform = transform
 
-        # ---------------------------------------------------------
-        # Base dataset instance
-        # ---------------------------------------------------------
-        #
-        # This is the instance created by Hydra:
-        #
-        #     dataset = SARRARP50Dataset(root=...)
-        #
-        # The actual train/val/test datasets are created later
-        # by create_official_split().
-        #
+        if not self.root.exists():
+            raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
 
         if split is None:
             self.split_root = None
             self.samples: List[Dict] = []
             return
-
-        # ---------------------------------------------------------
-        # Validate split
-        # ---------------------------------------------------------
 
         if split not in self.VALID_SPLITS:
             raise ValueError(
@@ -110,98 +87,57 @@ class SARRARP50Dataset(BaseSegmentationDataset):
                 f"Expected one of: {sorted(self.VALID_SPLITS)}."
             )
 
-        # ---------------------------------------------------------
-        # Split root
-        # ---------------------------------------------------------
-
         self.split_root = self.root / split
 
         if not self.split_root.exists():
-            raise FileNotFoundError(
-                f"SAR-RARP50 split not found: {self.split_root}"
-            )
+            raise FileNotFoundError(f"SAR-RARP50 split not found: {self.split_root}")
 
         if not self.split_root.is_dir():
             raise NotADirectoryError(
-                f"SAR-RARP50 split path is not a directory: "
-                f"{self.split_root}"
+                f"SAR-RARP50 split path is not a directory: {self.split_root}"
             )
-
-        # ---------------------------------------------------------
-        # Samples
-        # ---------------------------------------------------------
 
         self.samples: List[Dict] = []
 
         if preload_metadata:
             self._build_index()
 
-    # =============================================================
-    # INDEX
-    # =============================================================
-
     def _build_index(self) -> None:
-        """
-        Build an index containing one entry for every annotated frame.
-        """
-
+        """Build an index containing every annotated frame."""
         if self.split_root is None:
             raise RuntimeError(
-                "_build_index() cannot be called on the base dataset "
-                "without a split."
+                "_build_index() cannot be called on the base dataset without a split."
             )
 
         video_dirs = sorted(
-            p
-            for p in self.split_root.iterdir()
-            if p.is_dir() and p.name.startswith("video_")
+            path
+            for path in self.split_root.iterdir()
+            if path.is_dir() and path.name.startswith("video_")
         )
 
         if not video_dirs:
-            raise RuntimeError(
-                f"No video directories found in {self.split_root}"
-            )
+            raise RuntimeError(f"No video directories found in {self.split_root}")
 
         for video_dir in video_dirs:
-
             video_path = video_dir / "video_left.avi"
             segmentation_dir = video_dir / "segmentation"
 
-            # -----------------------------------------------------
-            # Video
-            # -----------------------------------------------------
-
             if not video_path.exists():
-                raise FileNotFoundError(
-                    f"Missing video file: {video_path}"
-                )
-
-            # -----------------------------------------------------
-            # Segmentation directory
-            # -----------------------------------------------------
+                raise FileNotFoundError(f"Missing video file: {video_path}")
 
             if not segmentation_dir.exists():
                 raise FileNotFoundError(
-                    f"Missing segmentation directory: "
-                    f"{segmentation_dir}"
+                    f"Missing segmentation directory: {segmentation_dir}"
                 )
 
             if not segmentation_dir.is_dir():
                 raise NotADirectoryError(
-                    f"Segmentation path is not a directory: "
-                    f"{segmentation_dir}"
+                    f"Segmentation path is not a directory: {segmentation_dir}"
                 )
 
-            # -----------------------------------------------------
-            # Masks
-            # -----------------------------------------------------
-
-            mask_paths = sorted(
-                segmentation_dir.glob("*.png")
-            )
+            mask_paths = sorted(segmentation_dir.glob("*.png"))
 
             for mask_path in mask_paths:
-
                 try:
                     frame_id = int(mask_path.stem)
                 except ValueError as exc:
@@ -220,20 +156,11 @@ class SARRARP50Dataset(BaseSegmentationDataset):
                 )
 
         if not self.samples:
-            raise RuntimeError(
-                f"No segmentation samples found in {self.split_root}"
-            )
-
-    # =============================================================
-    # LENGTH
-    # =============================================================
+            raise RuntimeError(f"No segmentation samples found in {self.split_root}")
 
     def __len__(self) -> int:
+        """Return the number of annotated frames."""
         return len(self.samples)
-
-    # =============================================================
-    # VIDEO CACHE
-    # =============================================================
 
     def _get_cap(
         self,
@@ -242,39 +169,26 @@ class SARRARP50Dataset(BaseSegmentationDataset):
         """
         Return a cached VideoCapture for the requested video.
 
-        The cache is initialized lazily so that each DataLoader worker
-        owns its own VideoCapture objects.
+        Each DataLoader worker gets its own cache.
         """
-
         if not hasattr(self, "_cap_cache"):
             self._cap_cache: dict[str, cv2.VideoCapture] = {}
 
         key = str(video_path)
 
         if key not in self._cap_cache:
-
             cap = cv2.VideoCapture(key)
 
             if not cap.isOpened():
-                raise RuntimeError(
-                    f"Unable to open video: {video_path}"
-                )
+                raise RuntimeError(f"Unable to open video: {video_path}")
 
             self._cap_cache[key] = cap
 
         return self._cap_cache[key]
 
-    # =============================================================
-    # CLEANUP
-    # =============================================================
-
     def __del__(self) -> None:
-        """
-        Release all cached VideoCapture objects.
-        """
-
+        """Release cached VideoCapture objects."""
         if hasattr(self, "_cap_cache"):
-
             for cap in self._cap_cache.values():
                 try:
                     cap.release()
@@ -283,24 +197,13 @@ class SARRARP50Dataset(BaseSegmentationDataset):
 
             self._cap_cache.clear()
 
-    # =============================================================
-    # LOAD SAMPLE
-    # =============================================================
-
     def _load_sample(self, index: int) -> Dict:
-        """
-        Load a single RGB frame and its segmentation mask.
-        """
-
+        """Load one RGB frame and its segmentation mask."""
         sample_info = self.samples[index]
 
         video_path = sample_info["video_path"]
         mask_path = sample_info["mask_path"]
         frame_id = sample_info["frame"]
-
-        # ---------------------------------------------------------
-        # Load video frame
-        # ---------------------------------------------------------
 
         cap = self._get_cap(video_path)
 
@@ -312,20 +215,12 @@ class SARRARP50Dataset(BaseSegmentationDataset):
         success, frame = cap.read()
 
         if not success:
-            raise RuntimeError(
-                f"Unable to read frame {frame_id} "
-                f"from {video_path}"
-            )
+            raise RuntimeError(f"Unable to read frame {frame_id} from {video_path}")
 
-        # OpenCV BGR -> RGB
         image = cv2.cvtColor(
             frame,
             cv2.COLOR_BGR2RGB,
         )
-
-        # ---------------------------------------------------------
-        # Load segmentation mask
-        # ---------------------------------------------------------
 
         mask = cv2.imread(
             str(mask_path),
@@ -333,46 +228,27 @@ class SARRARP50Dataset(BaseSegmentationDataset):
         )
 
         if mask is None:
-            raise RuntimeError(
-                f"Unable to read mask: {mask_path}"
-            )
-
-        # ---------------------------------------------------------
-        # Image / mask size check
-        # ---------------------------------------------------------
+            raise RuntimeError(f"Unable to read mask: {mask_path}")
 
         if image.shape[:2] != mask.shape[:2]:
             raise RuntimeError(
-                f"Image/mask size mismatch for "
-                f"{sample_info['video']} frame {frame_id}: "
-                f"image={image.shape}, "
-                f"mask={mask.shape}"
+                f"Image/mask size mismatch for {sample_info['video']} frame {frame_id}: "
+                f"image={image.shape}, mask={mask.shape}"
             )
-
-        # ---------------------------------------------------------
-        # Validate class IDs
-        # ---------------------------------------------------------
 
         unique_values = np.unique(mask)
 
         invalid_values = [
             int(value)
             for value in unique_values
-            if int(value) < 0
-            or int(value) >= self.NUM_CLASSES
+            if int(value) < 0 or int(value) >= self.num_classes
         ]
 
         if invalid_values:
             raise ValueError(
-                f"Invalid class ID found in mask {mask_path}: "
-                f"{unique_values}. "
-                f"Expected values in "
-                f"[0, {self.NUM_CLASSES - 1}]."
+                f"Invalid class IDs found in mask {mask_path}: {invalid_values}. "
+                f"Expected values in [0, {self.num_classes - 1}]."
             )
-
-        # ---------------------------------------------------------
-        # Return sample
-        # ---------------------------------------------------------
 
         return {
             "image": image,
@@ -381,72 +257,121 @@ class SARRARP50Dataset(BaseSegmentationDataset):
             "frame": frame_id,
         }
 
-    # =============================================================
-    # OFFICIAL SPLIT
-    # =============================================================
+    def _get_split_indices(
+        self,
+        split: str,
+    ) -> List[int]:
+        """Return indices belonging to a specific official split."""
+        return [
+            index for index, sample in enumerate(self.samples) if sample["split"] == split
+        ]
 
-    def create_official_split(self):
+    def _create_split_dataset(
+        self,
+        split: str,
+    ) -> Subset:
         """
-        Create the official SAR-RARP50 train/val/test datasets.
+        Create a dataset containing one official split.
 
-        SAR-RARP50 provides train and validation splits.
-        If no test split is present, test_ds is returned as None.
-
-        Returns
-        -------
-        tuple
-            train_ds, val_ds, test_ds
+        The base dataset contains samples from all official splits.
         """
+        split_indices = [
+            index for index, sample in enumerate(self.samples) if sample["split"] == split
+        ]
 
-        # ---------------------------------------------------------
-        # Train
-        # ---------------------------------------------------------
+        if not split_indices:
+            raise RuntimeError(f"No samples found for split '{split}'.")
 
-        train_path = self.root / "train"
+        return Subset(
+            self,
+            split_indices,
+        )
 
-        if not train_path.exists():
-            raise FileNotFoundError(
-                f"SAR-RARP50 train split not found: {train_path}"
+    def create_split(
+        self,
+        strategy: str,
+        group_by: str = "video",
+        train_ratio: float = 0.70,
+        val_ratio: float = 0.15,
+        test_ratio: float = 0.15,
+        seed: int = 42,
+        stratified: bool = False,
+    ) -> tuple[Subset, Subset, Subset | None]:
+        """
+        Create the official SAR-RARP50 train/validation/test split.
+
+        SAR-RARP50 already provides the split at video level, so the
+        ratio, seed and stratification parameters are not used.
+        """
+        if strategy != "official":
+            raise ValueError(
+                "SAR-RARP50 provides an official split. Use strategy='official'."
             )
 
-        train_ds = SARRARP50Dataset(
-            root=self.root,
+        if group_by != "video":
+            raise ValueError("SAR-RARP50 supports splitting only by video.")
+
+
+        train_dataset = SARRARP50Dataset(
+            root=str(self.root),
             split="train",
             transform=self.transform,
         )
 
-        # ---------------------------------------------------------
-        # Validation
-        # ---------------------------------------------------------
-
-        val_path = self.root / "val"
-
-        if not val_path.exists():
-            raise FileNotFoundError(
-                f"SAR-RARP50 validation split not found: {val_path}"
-            )
-
-        val_ds = SARRARP50Dataset(
-            root=self.root,
+        val_dataset = SARRARP50Dataset(
+            root=str(self.root),
             split="val",
             transform=self.transform,
         )
 
-        # ---------------------------------------------------------
-        # Test
-        # ---------------------------------------------------------
-
         test_path = self.root / "test"
 
-        if test_path.exists():
+        test_dataset = None
 
-            test_ds = SARRARP50Dataset(
-                root=self.root,
+        if test_path.exists():
+            test_dataset = SARRARP50Dataset(
+                root=str(self.root),
                 split="test",
                 transform=self.transform,
             )
 
-        else:
-            test_ds = None
+        train_videos = sorted({sample["video"] for sample in train_dataset.samples})
 
-        return train_ds, val_ds, test_ds
+        val_videos = sorted({sample["video"] for sample in val_dataset.samples})
+
+        test_videos = []
+
+        if test_dataset is not None:
+            test_videos = sorted({sample["video"] for sample in test_dataset.samples})
+
+        print("\n" + "=" * 60)
+        print("DATASET SPLIT")
+        print("=" * 60)
+
+        print("\nTrain:")
+        print(f"  Groups : {train_videos}")
+        print(f"  Frames : {len(train_dataset)}")
+
+        print("\nValidation:")
+        print(f"  Groups : {val_videos}")
+        print(f"  Frames : {len(val_dataset)}")
+
+        if test_dataset is not None:
+            print("\nTest:")
+            print(f"  Groups : {test_videos}")
+            print(f"  Frames : {len(test_dataset)}")
+
+        print("\nTotal:")
+        total_frames = (
+            len(train_dataset)
+            + len(val_dataset)
+            + (len(test_dataset) if test_dataset is not None else 0)
+        )
+
+        total_groups = len(set(train_videos) | set(val_videos) | set(test_videos))
+
+        print(f"  Groups : {total_groups}")
+        print(f"  Frames : {total_frames}")
+        print("=" * 60)
+
+        return train_dataset, val_dataset, test_dataset

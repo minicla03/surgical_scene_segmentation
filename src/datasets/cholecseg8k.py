@@ -1,17 +1,17 @@
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 from torch.utils.data import Subset
 
 from src.datasets.base_dataset import BaseSegmentationDataset
 
 
 class CholecSeg8kDataset(BaseSegmentationDataset):
-
-    NUM_CLASSES = 13
-
+    
     CLASS_NAMES = [
         "Background",
         "Abdominal Wall",
@@ -28,106 +28,70 @@ class CholecSeg8kDataset(BaseSegmentationDataset):
         "Liver Ligament",
     ]
 
-    # Original watershed mask value -> contiguous class ID
+    # Original watershed mask value -> contiguous class ID.
+    # Reference:
     # https://constantinpape.github.io/torch-em/torch_em/data/datasets/medical/cholecseg8k.html
     LABEL_MAP = {
-        255: 0,   # Background
-        50: 0,    # Background
-        0: 0,     # Background
-        11: 1,    # Abdominal Wall
-        21: 2,    # Liver
-        13: 3,    # Gastrointestinal Tract
-        12: 4,    # Fat
-        31: 5,    # Grasper
-        23: 6,    # Connective Tissue
-        24: 7,    # Blood
-        25: 8,    # Cystic Duct
-        32: 9,    # L-hook Electrocautery
-        22: 10,   # Gallbladder
-        33: 11,   # Hepatic Vein
-        5: 12,    # Liver Ligament
+        255: 0,
+        50: 0,
+        0: 0,
+        11: 1,
+        21: 2,
+        13: 3,
+        12: 4,
+        31: 5,
+        23: 6,
+        24: 7,
+        25: 8,
+        32: 9,
+        22: 10,
+        33: 11,
+        5: 12,
     }
 
-    def __init__(
-        self,
-        root,
-        transform=None,
-    ):
-        super().__init__(
-            root=root,
-            transform=transform,
-        )
+    def __init__(self, root, transform=None):
+        super().__init__(root=root, transform=transform)
 
         self.root = Path(root)
-
         if not self.root.exists():
-            raise FileNotFoundError(
-                f"Dataset root does not exist: {self.root}"
-            )
+            raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
 
         video_dirs = sorted(
-            p for p in self.root.iterdir()
-            if p.is_dir() and p.name.startswith("video")
+            p for p in self.root.iterdir() if p.is_dir() and p.name.startswith("video")
         )
 
         if not video_dirs:
-            raise RuntimeError(
-                f"No video directories found in {self.root}"
-            )
+            raise RuntimeError(f"No video directories found in {self.root}")
 
         self.video_ids = sorted(
-            int(p.name.replace("video", ""))
-            for p in video_dirs
+            int(path.name.replace("video", "")) for path in video_dirs
         )
 
-        # --------------------------------------------------
-        # Build frame-level index
-        # --------------------------------------------------
-
         self.samples = []
-
         self._build_index()
+        self.video_class_presence = self._build_video_class_presence()
 
-    # ======================================================
-    # Dataset index
-    # ======================================================
-
-    def _build_index(self):
+    def _build_index(self) -> None:
+        """Build a frame-level index while preserving video information."""
 
         for video_id in self.video_ids:
-
             video_name = f"video{video_id:02d}"
             video_dir = self.root / video_name
 
-            clip_dirs = sorted(
-                p for p in video_dir.iterdir()
-                if p.is_dir()
-            )
+            clip_dirs = sorted(path for path in video_dir.iterdir() if path.is_dir())
 
             for clip_dir in clip_dirs:
-
-                image_paths = sorted(
-                    clip_dir.glob("*_endo.png")
-                )
+                image_paths = sorted(clip_dir.glob("*_endo.png"))
 
                 for image_path in image_paths:
-
                     mask_path = image_path.with_name(
-                        image_path.name.replace(
-                            "_endo.png",
-                            "_endo_watershed_mask.png",
-                        )
+                        image_path.name.replace("_endo.png", "_endo_watershed_mask.png")
                     )
 
                     if not mask_path.exists():
-                        raise FileNotFoundError(
-                            f"Missing mask:\n{mask_path}"
-                        )
+                        raise FileNotFoundError(f"Missing mask:\n{mask_path}")
 
-                    frame_name = image_path.stem.replace(
-                        "_endo",
-                        "",
-                    )
+                    frame_name = image_path.stem.replace("_endo", "")
 
                     self.samples.append(
                         {
@@ -140,116 +104,75 @@ class CholecSeg8kDataset(BaseSegmentationDataset):
                         }
                     )
 
-    # ======================================================
-    # Dataset interface
-    # ======================================================
+    def _build_video_class_presence(self) -> dict[int, set[int]]:
+        """Return the set of semantic classes present in each video."""
 
-    def __len__(self):
+        video_classes = {video_id: set() for video_id in self.video_ids}
+
+        for sample in self.samples:
+            mask = cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE)
+
+            if mask is None:
+                raise RuntimeError(f"Could not read mask:\n{sample['mask_path']}")
+
+            unique_values = np.unique(mask)
+            unknown_values = set(unique_values.tolist()) - set(self.LABEL_MAP)
+
+            if unknown_values:
+                raise ValueError(
+                    f"Unknown mask values {sorted(unknown_values)} in:\n{sample['mask_path']}"
+                )
+
+            classes = {self.LABEL_MAP[int(value)] for value in unique_values}
+            video_classes[sample["video_id"]].update(classes)
+
+        return video_classes
+
+    def __len__(self) -> int:
+        """Return the number of frames."""
+
         return len(self.samples)
 
-    def _load_sample(self, index):
+    def _load_sample(self, index: int) -> dict:
+        """Load and preprocess one image-mask pair."""
 
         info = self.samples[index]
 
-        # --------------------------------------------------
-        # Image
-        # --------------------------------------------------
-
-        image = cv2.imread(
-            str(info["image_path"]),
-            cv2.IMREAD_COLOR,
-        )
-
+        image = cv2.imread(str(info["image_path"]), cv2.IMREAD_COLOR)
         if image is None:
-            raise RuntimeError(
-                f"Could not read image:\n"
-                f"{info['image_path']}"
-            )
+            raise RuntimeError(f"Could not read image:\n{info['image_path']}")
 
-        image = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2RGB,
-        )
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # --------------------------------------------------
-        # Mask
-        # --------------------------------------------------
-
-        mask_rgb = cv2.imread(
-            str(info["mask_path"]),
-            cv2.IMREAD_COLOR,
-        )
-
+        mask_rgb = cv2.imread(str(info["mask_path"]), cv2.IMREAD_COLOR)
         if mask_rgb is None:
-            raise RuntimeError(
-                f"Could not read mask:\n"
-                f"{info['mask_path']}"
-            )
-
-        # The mask is stored as RGB/BGR,
-        # but all channels contain the same values.
+            raise RuntimeError(f"Could not read mask:\n{info['mask_path']}")
 
         if not (
-            np.array_equal(
-                mask_rgb[:, :, 0],
-                mask_rgb[:, :, 1],
-            )
-            and
-            np.array_equal(
-                mask_rgb[:, :, 1],
-                mask_rgb[:, :, 2],
-            )
+            np.array_equal(mask_rgb[:, :, 0], mask_rgb[:, :, 1])
+            and np.array_equal(mask_rgb[:, :, 1], mask_rgb[:, :, 2])
         ):
-            raise ValueError(
-                f"Mask channels are not identical:\n"
-                f"{info['mask_path']}"
-            )
+            raise ValueError(f"Mask channels are not identical:\n{info['mask_path']}")
 
         mask_original = mask_rgb[:, :, 0]
-
-        # --------------------------------------------------
-        # Check values
-        # --------------------------------------------------
-
         unique_values = np.unique(mask_original)
-
-        unknown_values = (
-            set(unique_values.tolist())
-            - set(self.LABEL_MAP.keys())
-        )
+        unknown_values = set(unique_values.tolist()) - set(self.LABEL_MAP)
 
         if unknown_values:
             raise ValueError(
-                f"Unknown mask values "
-                f"{sorted(unknown_values)} in:\n"
-                f"{info['mask_path']}"
+                f"Unknown mask values {sorted(unknown_values)} in:\n{info['mask_path']}"
             )
 
-        # --------------------------------------------------
-        # Convert dataset labels -> 0 ... NUM_CLASSES-1
-        # --------------------------------------------------
-
-        mask = np.zeros(
-            mask_original.shape,
-            dtype=np.uint8,
-        )
+        mask = np.zeros(mask_original.shape, dtype=np.uint8)
 
         for original_value, class_id in self.LABEL_MAP.items():
-
-            mask[
-                mask_original == original_value
-            ] = class_id
-
-        # --------------------------------------------------
-        # Shape check
-        # --------------------------------------------------
+            mask[mask_original == original_value] = class_id
 
         if image.shape[:2] != mask.shape:
-
             raise RuntimeError(
-                "Image/mask size mismatch:\n"
+                f"Image/mask size mismatch:\n"
                 f"Image: {image.shape[:2]}\n"
-                f"Mask : {mask.shape}"
+                f"Mask: {mask.shape}"
             )
 
         return {
@@ -261,275 +184,242 @@ class CholecSeg8kDataset(BaseSegmentationDataset):
             "frame": info["frame"],
         }
 
-    # ======================================================
-    # Official split interface (required by start_experiment.py)
-    # ======================================================
-
-    def create_official_split(
-        self,
-        train_ratio: float = 0.70,
-        val_ratio: float = 0.15,
-        test_ratio: float = 0.15,
-        seed: int = 42,
-    ):
-        """
-        Return (train_subset, val_subset, test_subset) using a
-        reproducible random video-level split.
-
-        CholecSeg8k does not ship a fixed official split; this method
-        applies a deterministic 70/15/15 video-level partition so that
-        no video leaks across splits.
-
-        Returns
-        -------
-        tuple[Subset, Subset, Subset]
-        """
-
-        splits, _ = self.create_random_split(
-            train_ratio=train_ratio,
-            val_ratio=val_ratio,
-            test_ratio=test_ratio,
-            seed=seed,
-        )
-
-        return (
-            splits["train"],
-            splits["val"],
-            splits["test"],
-        )
-
-    # ======================================================
-    # Split utilities
-    # ======================================================
-
-    def get_video_indices(
-        self,
-        video_ids: List[int],
-    ) -> List[int]:
-
-        video_ids = set(int(v) for v in video_ids)
-
+    def get_video_indices(self, video_ids: list[int]) -> list[int]:
+        """Return frame indices belonging to the given videos."""
+        video_ids = {int(video_id) for video_id in video_ids}
         available_videos = set(self.video_ids)
+        missing_videos = video_ids - available_videos
 
-        missing = video_ids - available_videos
+        if missing_videos:
+            raise ValueError(f"Unknown video IDs: {sorted(missing_videos)}")
 
-        if missing:
-            raise ValueError(
-                f"Unknown video IDs: {sorted(missing)}"
-            )
-
-        indices = [
-            idx
-            for idx, sample in enumerate(self.samples)
+        return [
+            index
+            for index, sample in enumerate(self.samples)
             if sample["video_id"] in video_ids
         ]
 
-        return indices
+    def _validate_video_split(
+        self,
+        train_videos: list[int],
+        val_videos: list[int],
+        test_videos: list[int],
+    ) -> None:
+        """Validate that video groups do not overlap."""
+        train_videos = set(train_videos)
+        val_videos = set(val_videos)
+        test_videos = set(test_videos)
 
-    # ======================================================
-    # Create custom split
-    # ======================================================
+        if train_videos & val_videos:
+            raise ValueError(
+                f"Videos present in both train and validation: {sorted(train_videos & val_videos)}"
+            )
+
+        if train_videos & test_videos:
+            raise ValueError(
+                f"Videos present in both train and test: {sorted(train_videos & test_videos)}"
+            )
+
+        if val_videos & test_videos:
+            raise ValueError(
+                f"Videos present in both validation and test: {sorted(val_videos & test_videos)}"
+            )
+
+        requested_videos = train_videos | val_videos | test_videos
+        unknown_videos = requested_videos - set(self.video_ids)
+
+        if unknown_videos:
+            raise ValueError(f"Unknown video IDs: {sorted(unknown_videos)}")
+
+    def _create_subsets(
+        self,
+        train_videos: list[int],
+        val_videos: list[int],
+        test_videos: list[int],
+    ) -> tuple[Subset, Subset, Subset | None]:
+        """Create frame-level subsets from non-overlapping video groups."""
+        self._validate_video_split(train_videos, val_videos, test_videos)
+
+        train_dataset = Subset(self, self.get_video_indices(train_videos))
+        val_dataset = Subset(self, self.get_video_indices(val_videos))
+
+        test_dataset = None
+        if test_videos:
+            test_dataset = Subset(self, self.get_video_indices(test_videos))
+
+        return train_dataset, val_dataset, test_dataset
+
+    def _create_random_video_split(
+        self,
+        train_ratio: float,
+        val_ratio: float,
+        test_ratio: float,
+        seed: int,
+    ) -> tuple[Subset, Subset, Subset | None]:
+        """Create a reproducible random split at video level."""
+        rng = np.random.default_rng(seed)
+        shuffled_videos = np.array(self.video_ids, dtype=int)
+        rng.shuffle(shuffled_videos)
+
+        num_videos = len(shuffled_videos)
+        num_train = int(num_videos * train_ratio)
+        num_val = int(num_videos * val_ratio)
+        num_test = num_videos - num_train - num_val
+
+        if num_train == 0 or num_val == 0:
+            raise ValueError(
+                "Train and validation splits must contain at least one video."
+            )
+
+        if test_ratio > 0 and num_test == 0:
+            raise ValueError("Test split is enabled but contains zero videos.")
+
+        train_videos = sorted(shuffled_videos[:num_train].tolist())
+        val_videos = sorted(shuffled_videos[num_train : num_train + num_val].tolist())
+        test_videos = sorted(shuffled_videos[num_train + num_val :].tolist())
+
+        return self._create_subsets(train_videos, val_videos, test_videos)
+
+    def _create_stratified_video_split(
+        self,
+        train_ratio: float,
+        val_ratio: float,
+        test_ratio: float,
+        seed: int,
+    ) -> tuple[Subset, Subset, Subset | None]:
+        """Create a multilabel-stratified split at video level."""
+
+        video_ids = np.array(self.video_ids, dtype=int)
+
+        labels = np.zeros((len(video_ids), self.num_classes), dtype=np.int8)
+
+        for row, video_id in enumerate(video_ids):
+            for class_id in self.video_class_presence[video_id]:
+                labels[row, class_id] = 1
+
+        if test_ratio > 0:
+            temp_ratio = val_ratio + test_ratio
+
+            first_splitter = MultilabelStratifiedShuffleSplit(
+                n_splits=1, test_size=temp_ratio, random_state=seed
+            )
+            train_indices, temp_indices = next(first_splitter.split(video_ids, labels))
+
+            temp_video_ids = video_ids[temp_indices]
+            temp_labels = labels[temp_indices]
+
+            relative_test_ratio = test_ratio / temp_ratio
+
+            second_splitter = MultilabelStratifiedShuffleSplit(
+                n_splits=1, test_size=relative_test_ratio, random_state=seed
+            )
+            val_indices, test_indices = next(
+                second_splitter.split(temp_video_ids, temp_labels)
+            )
+
+            train_videos = sorted(video_ids[train_indices].tolist())
+            val_videos = sorted(temp_video_ids[val_indices].tolist())
+            test_videos = sorted(temp_video_ids[test_indices].tolist())
+
+        else:
+            first_splitter = MultilabelStratifiedShuffleSplit(
+                n_splits=1, test_size=val_ratio, random_state=seed
+            )
+            train_indices, val_indices = next(first_splitter.split(video_ids, labels))
+
+            train_videos = sorted(video_ids[train_indices].tolist())
+            val_videos = sorted(video_ids[val_indices].tolist())
+            test_videos = []
+
+        return self._create_subsets(train_videos, val_videos, test_videos)
 
     def create_split(
         self,
-        train_videos: List[int],
-        val_videos: List[int],
-        test_videos: List[int],
-    ) -> Dict[str, Subset]:
-
-        train_videos = set(int(v) for v in train_videos)
-        val_videos = set(int(v) for v in val_videos)
-        test_videos = set(int(v) for v in test_videos)
-
-        # --------------------------------------------------
-        # Check overlap
-        # --------------------------------------------------
-
-        train_val = train_videos & val_videos
-        train_test = train_videos & test_videos
-        val_test = val_videos & test_videos
-
-        if train_val:
-            raise ValueError(
-                f"Videos present in both train and val: "
-                f"{sorted(train_val)}"
-            )
-
-        if train_test:
-            raise ValueError(
-                f"Videos present in both train and test: "
-                f"{sorted(train_test)}"
-            )
-
-        if val_test:
-            raise ValueError(
-                f"Videos present in both val and test: "
-                f"{sorted(val_test)}"
-            )
-
-        # --------------------------------------------------
-        # Check that all videos exist
-        # --------------------------------------------------
-
-        requested_videos = (
-            train_videos
-            | val_videos
-            | test_videos
-        )
-
-        unknown_videos = (
-            requested_videos
-            - set(self.video_ids)
-        )
-
-        if unknown_videos:
-            raise ValueError(
-                f"Unknown video IDs: "
-                f"{sorted(unknown_videos)}"
-            )
-
-        # --------------------------------------------------
-        # Create frame indices
-        # --------------------------------------------------
-
-        train_indices = self.get_video_indices(
-            train_videos
-        )
-
-        val_indices = self.get_video_indices(
-            val_videos
-        )
-
-        test_indices = self.get_video_indices(
-            test_videos
-        )
-
-        # --------------------------------------------------
-        # Create PyTorch subsets
-        # --------------------------------------------------
-
-        return {
-            "train": Subset(
-                self,
-                train_indices,
-            ),
-            "val": Subset(
-                self,
-                val_indices,
-            ),
-            "test": Subset(
-                self,
-                test_indices,
-            ),
-        }
-
-    # ======================================================
-    # Random split at VIDEO level
-    # ======================================================
-
-    def create_random_split(
-        self,
+        strategy: str,
+        group_by: str = "video",
         train_ratio: float = 0.70,
         val_ratio: float = 0.15,
         test_ratio: float = 0.15,
         seed: int = 42,
-    ) -> Tuple[Dict[str, Subset], Dict[str, List[int]]]:
+        stratified: bool = True,
+    ) -> tuple[Subset, Subset, Subset | None]:
+        """Create train, validation and optional test splits."""
 
-        if not np.isclose(
-            train_ratio
-            + val_ratio
-            + test_ratio,
-            1.0,
-        ):
+        if group_by != "video":
             raise ValueError(
-                "Split ratios must sum to 1."
+                "CholecSeg8k supports splitting only by video."
             )
 
-        if (
-            train_ratio <= 0
-            or val_ratio <= 0
-            or test_ratio <= 0
-        ):
+        if strategy == "official":
             raise ValueError(
-                "All split ratios must be > 0."
+                "CholecSeg8k does not provide an official split. "
+                "Use strategy='percentage'."
             )
 
-        # --------------------------------------------------
-        # Shuffle VIDEO IDs
-        # --------------------------------------------------
+        if strategy != "percentage":
+            raise ValueError(f"Unsupported split strategy: {strategy}")
+                
 
-        rng = np.random.default_rng(seed)
+        if train_ratio <= 0 or val_ratio <= 0:
+            raise ValueError("Train and validation ratios must be greater than zero.")
 
-        shuffled_videos = np.array(
-            self.video_ids,
-            dtype=int,
-        )
+        if test_ratio < 0:
+            raise ValueError("Test ratio cannot be negative.")
 
-        rng.shuffle(shuffled_videos)
+        total_ratio = train_ratio + val_ratio + test_ratio
 
-        # --------------------------------------------------
-        # Compute number of videos
-        # --------------------------------------------------
+        if not np.isclose(total_ratio, 1.0):
+            raise ValueError("Train, validation and test ratios must sum to 1.0.")
 
-        n_videos = len(shuffled_videos)
+        if stratified:
+            train_dataset, val_dataset, test_dataset = (
 
-        n_train = int(
-            n_videos * train_ratio
-        )
-
-        n_val = int(
-            n_videos * val_ratio
-        )
-
-        n_test = (
-            n_videos
-            - n_train
-            - n_val
-        )
-
-        if (
-            n_train == 0
-            or n_val == 0
-            or n_test == 0
-        ):
-            raise ValueError(
-                "One split contains zero videos."
+                self._create_stratified_video_split(
+                    train_ratio=train_ratio,
+                    val_ratio=val_ratio,
+                    test_ratio=test_ratio,
+                    seed=seed,
+                )
             )
-
-        # --------------------------------------------------
-        # Assign videos
-        # --------------------------------------------------
+        else:
+            train_dataset, val_dataset, test_dataset = (
+                self._create_random_video_split(
+                    train_ratio=train_ratio,
+                    val_ratio=val_ratio,
+                    test_ratio=test_ratio,
+                    seed=seed,
+                )
+            )
 
         train_videos = sorted(
-            shuffled_videos[:n_train].tolist()
+            {
+                self.samples[index]["video_id"]
+                for index in train_dataset.indices
+            }
         )
 
         val_videos = sorted(
-            shuffled_videos[
-                n_train:n_train + n_val
-            ].tolist()
+            {
+                self.samples[index]["video_id"]
+                for index in val_dataset.indices
+            }
         )
 
-        test_videos = sorted(
-            shuffled_videos[
-                n_train + n_val:
-            ].tolist()
+        test_videos = []
+
+        if test_dataset is not None:
+            test_videos = sorted(
+                {
+                    self.samples[index]["video_id"]
+                    for index in test_dataset.indices
+                }
+            )
+
+        self.log_split(
+            train_groups=train_videos,
+            val_groups=val_videos,
+            test_groups=test_videos,
+            group_key="video_id",
         )
 
-        # --------------------------------------------------
-        # Create Subsets
-        # --------------------------------------------------
-
-        splits = self.create_split(
-            train_videos=train_videos,
-            val_videos=val_videos,
-            test_videos=test_videos,
-        )
-
-        split_videos = {
-            "train": train_videos,
-            "val": val_videos,
-            "test": test_videos,
-        }
-
-        return splits, split_videos
+        return train_dataset, val_dataset, test_dataset

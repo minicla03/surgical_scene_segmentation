@@ -1,0 +1,80 @@
+# @package _global_
+
+
+name: sarrarp50
+
+data:
+  name: sarrarp50
+
+  dataset:
+    _target_: src.datasets.sarrarp50_dataset.SARRARP50Dataset
+    root: ${paths.data}/SARRARP50
+
+  num_classes: 10
+
+  split:
+    strategy: official
+    stratified: false
+
+
+# ============================================================
+# PREPROCESSING
+# ============================================================
+
+preprocessing:
+
+  image:
+    size: [384, 480]
+    channel_first: true
+    dtype: float32
+    normalize: true
+
+  mask:
+    channel_first: true
+    dtype: long
+
+
+# ============================================================
+# AUGMENTATION
+# ============================================================
+
+augmentation:
+
+  train:
+    enabled: true
+
+    scaling:
+      enabled: true
+      range: [-0.10, 0.10]
+      probability: 0.3
+
+    rotation:
+      enabled: true
+      range: [-10, 10]
+      probability: 0.3
+
+    translation:
+      enabled: true
+      range: [-0.05, 0.05]
+      probability: 0.3
+
+    horizontal_flip:
+      enabled: true
+      probability: 0.5
+
+    vertical_flip:
+      enabled: false
+
+    color_jitter:
+      enabled: true
+      probability: 0.3
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.05
+
+  validation:
+    enabled: false
+
+  test:
+    enabled: false

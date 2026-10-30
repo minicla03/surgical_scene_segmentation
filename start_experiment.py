@@ -8,7 +8,7 @@ from hydra.utils import instantiate
 from torch.utils.data import DataLoader
 
 from src.engine.trainer import Trainer
-from src.engine.evaluator import Evaluator
+#from src.engine.evaluator import Evaluator
 from src.utils.repro import set_seed, seed_worker
 from src.utils.wandb_logging import WandbLogger
 from src.datasets.transformation.factory import TransformFactory
@@ -53,26 +53,68 @@ def main(cfg: DictConfig):
 
         log_step(3, "Instantiating dataset...")
         dataset = instantiate(cfg.data.dataset)
+
         log_step(3, "Dataset instantiated.")
 
-        log_step(3, "Creating official train/val/test split...")
-        train_dataset, val_dataset, test_dataset = dataset.create_official_split()
+        log_step(3, "Creating train/validation/test split...")
+
+        split_cfg = cfg.data.split
+
+        split_kwargs = {
+            "strategy": split_cfg.strategy,
+            "group_by": split_cfg.group_by,
+        }
+
+        if split_cfg.strategy == "percentage":
+            split_kwargs.update(
+                {
+                    "train_ratio": split_cfg.train_ratio,
+                    "val_ratio": split_cfg.val_ratio,
+                    "test_ratio": split_cfg.test_ratio,
+                    "seed": split_cfg.get(
+                        "seed",
+                        cfg.experiment.seed,
+                    ),
+                    "stratified": split_cfg.get(
+                        "stratified",
+                        False,
+                    ),
+                }
+            )
+
+        train_dataset, val_dataset, test_dataset = dataset.create_split(**split_kwargs)
+
         log_step(3, "Dataset split completed.")
-        print(f"           Train samples: {len(train_dataset)}", flush=True)
-        print(f"           Val samples  : {len(val_dataset)}", flush=True)
-        print(f"           Test samples : {len(test_dataset)}", flush=True)
 
         log_step(4, "Building transforms...")
         transform_factory = TransformFactory(cfg)
         train_transform = transform_factory.build_train_transform()
         val_transform = transform_factory.build_val_transform()
-        test_transform = transform_factory.build_test_transform()
+        test_transform = transform_factory.build_test_transform() if test_dataset is not None else None
         log_step(4, "Transforms built.")
 
         log_step(5, "Wrapping datasets with TransformDataset...")
-        train_dataset = TransformDataset(train_dataset, transform=train_transform)
-        val_dataset = TransformDataset(val_dataset, transform=val_transform)
-        test_dataset = TransformDataset(test_dataset, transform=test_transform)
+        
+        log_step(5, "Wrapping datasets with TransformDataset...")
+
+        if train_dataset is not None:
+            train_dataset = TransformDataset(
+                train_dataset,
+                transform=train_transform,
+            )
+
+        if val_dataset is not None:
+            val_dataset = TransformDataset(
+                val_dataset,
+                transform=val_transform,
+            )
+
+        if test_dataset is not None:
+            test_dataset = TransformDataset(
+                test_dataset,
+                transform=test_transform,
+            )
+
         log_step(5, "Datasets wrapped.")
 
         log_step(6, "Creating DataLoaders...")
@@ -148,17 +190,21 @@ def main(cfg: DictConfig):
             name: instantiate(metric_cfg)
             for name, metric_cfg in cfg.evaluation.metrics.items()
         }
-        # Costruiamo il mapping class_index -> class_name dal config (se disponibile)
-        class_names: dict[int, str] | None = None
-        raw_classes = cfg.data.get("classes", None)
-        if raw_classes is not None:
-            class_names = {int(k): str(v) for k, v in raw_classes.items()}
+
+        if hasattr(dataset, "CLASS_NAMES"):
+            class_names = {i: name for i, name in enumerate(dataset.CLASS_NAMES)}
+        else:
+            raise ValueError(f"CLASS_NAMES attribute is missing in dataset {cfg.data.name}")
+
+        num_classes = dataset.num_classes
+        
         metric_manager = MetricManager(
             metrics=metrics,
-            num_classes=cfg.data.num_classes,
+            num_classes=num_classes,
             dataset_name=cfg.data.name,
             class_names=class_names,
         )
+
         log_step(10, "Metrics initialized.")
 
         log_step(11, "Initializing Trainer...")
@@ -185,6 +231,38 @@ def main(cfg: DictConfig):
         checkpoint = torch.load(train_results["best_checkpoint"], map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         log_step(13, "Best checkpoint loaded.")
+
+
+        #if test_loader is not None:
+        #
+        #     log_step(14, "Starting final test evaluation...")
+        #
+        #     test_metrics = MetricManager(
+        #         metrics={
+        #             name: instantiate(metric_cfg)
+        #             for name, metric_cfg
+        #             in cfg.evaluation.metrics.items()
+        #         },
+        #         num_classes=cfg.data.num_classes,
+        #         dataset_name=cfg.data.name,
+        #         class_names=class_names,
+        #     )
+        #
+        #     evaluator = Evaluator(
+        #         model=model,
+        #         data_loader=test_loader,
+        #         metric_manager=test_metrics,
+        #         device=device,
+        #     )
+        #
+        #     test_results = evaluator.evaluate()
+        #
+        #     logger.log_final_results(
+        #         train_results,
+        #         test_results,
+        #     )
+        #
+        #     log_step(14, "Final test evaluation completed.")
 
         log_step(14, "Logging final results...")
         logger.log_final_results(train_results, {})

@@ -1,5 +1,6 @@
 defaults:
-  - experiment: baseline/cholec_instance_seg8k
+  - dataset: baseline/cholecseg8k
+  - training: baseline/cholec_instance_seg8k
   - model: baseline/unet
   - _self_
 

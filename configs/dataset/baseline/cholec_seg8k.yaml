@@ -1,0 +1,82 @@
+# @package _global_
+
+# https://pmc.ncbi.nlm.nih.gov/articles/PMC11022235/
+
+
+name: cholecseg8k
+
+data:
+  name: cholecseg8k
+
+  dataset:
+    _target_: src.datasets.cholecseg8k.CholecSeg8kDataset
+    root: ${paths.data}/CholecSeg8k
+
+  num_classes: 13
+
+  split:
+    strategy: percentage
+
+    group_by: video
+    seed: 42
+
+    stratified: true #https://medium.com/gumgum-tech/creating-balanced-multi-label-datasets-for-model-training-and-evaluation-16b6a3a2d912
+
+    train: 70
+    validation: 10
+    test: 20
+
+# ============================================================
+# PREPROCESSING
+# ============================================================
+
+preprocessing:
+
+  image:
+    size: [240, 427]
+    channel_first: true
+    dtype: float32
+    normalize: true
+
+  mask:
+    channel_first: true
+    dtype: long
+
+  padding:
+    enabled: true
+    divisor: 16
+
+
+# ============================================================
+# AUGMENTATION
+# ============================================================
+
+augmentation:
+
+  train:
+    enabled: true
+
+    horizontal_flip:
+      enabled: true
+      probability: 0.5
+
+    scaling:
+      enabled: true
+      range: [-0.1, 0.1]
+      probability: 1.0
+
+    gaussian_blur:
+      enabled: true
+      probability: 1.0
+      kernel_sizes: [3, 5, 7]
+      sigmas: [0.8, 1.1, 1.4]
+
+    random_crop:
+      enabled: true
+      size: [256, 256]
+
+  validation:
+    enabled: false
+
+  test:
+    enabled: false

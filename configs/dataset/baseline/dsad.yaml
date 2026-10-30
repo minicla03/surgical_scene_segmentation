@@ -1,0 +1,77 @@
+# @package _global_
+
+# https://pmc.ncbi.nlm.nih.gov/articles/PMC10583931/
+# Official split:
+# https://huggingface.co/datasets/nct-tso/dsad
+
+# ============================================================
+# DATASET
+# ============================================================
+
+name: dsad
+
+data:
+  name: dsad
+
+  dataset:
+    _target_: src.datasets.dsad_dataset.DSADDataset
+    root: ${paths.data}/DSAD
+    variant: multi_organ
+
+  num_classes: 2
+
+  split:
+    strategy: official
+
+    stratified: false
+
+
+# ============================================================
+# PREPROCESSING
+# ============================================================
+
+preprocessing:
+
+  image:
+    size: [384, 480]
+    channel_first: true
+    dtype: float32
+    normalize: true
+
+  mask:
+    channel_first: false
+    dtype: long
+
+
+# ============================================================
+# AUGMENTATION
+# ============================================================
+
+augmentation:
+
+  train:
+    enabled: true
+
+    scaling:
+      enabled: true
+      range: [-0.1, 0.1]
+      probability: 0.5
+
+    rotation:
+      enabled: true
+      range: [-15, 15]
+      probability: 0.5
+
+    brightness:
+      enabled: true
+      probability: 0.5
+
+    contrast:
+      enabled: true
+      probability: 0.5
+
+  validation:
+    enabled: false
+
+  test:
+    enabled: false

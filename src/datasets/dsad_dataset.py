@@ -1,6 +1,5 @@
-from pathlib import Path
 from io import BytesIO
-from typing import Optional, Sequence
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -11,31 +10,89 @@ from src.datasets.base_dataset import BaseSegmentationDataset
 
 
 class DSADDataset(BaseSegmentationDataset):
+
     """
-    DSAD single_organ dataset.
+    DSAD dataset supporting both:
 
-    Each row represents one segmentation sample:
-        - surgery_id
-        - frame_id
-        - organ
-        - image
-        - mask
+        - single_organ
+        - multi_organ
 
-    The official split is defined at surgery level:
-        - train: 21 surgeries
-        - validation: 3 surgeries
-        - test: 8 surgeries
+    Parameters
+    ----------
+    root:
+        Root directory containing the DSAD variants.
 
-    The target is binary:
+    variant:
+        Dataset variant:
+            "single_organ"
+            "multi_organ"
+
+    transform:
+        Optional MONAI transform.
+
+    ---------------------------------------------------------------
+    SINGLE ORGAN
+    ---------------------------------------------------------------
+
+    Each row represents one image/organ pair:
+
+        image
+        mask
+        organ
+
+    Target:
+
         0 = background
         1 = target organ
 
-    Only the ``single_organ`` variant is currently supported.
+    ---------------------------------------------------------------
+    MULTI ORGAN
+    ---------------------------------------------------------------
+
+    Each row represents one image with multiple organ masks:
+
+        image
+        mask_abdominal_wall
+        mask_colon
+        ...
+        mask_stomach
+
+    Target:
+
+        0 = background
+        1 = abdominal_wall
+        2 = colon
+        3 = liver
+        4 = pancreas
+        5 = small_intestine
+        6 = spleen
+        7 = stomach
     """
 
-    VARIANT = "single_organ"
 
-    ORGAN_COLUMNS = [
+    SUPPORTED_VARIANTS = {"single_organ", "multi_organ"}
+
+    SINGLE_ORGAN_CLASS_NAMES = [
+        "background",
+        "organ",
+    ]
+
+    MULTI_ORGAN_COLUMNS = [
+        "abdominal_wall",
+        "colon",
+        "liver",
+        "pancreas",
+        "small_intestine",
+        "spleen",
+        "stomach",
+    ]
+
+    MULTI_ORGAN_CLASS_NAMES = [
+        "background",
+        *MULTI_ORGAN_COLUMNS,
+    ]
+
+    SINGLE_ORGAN_COLUMNS = [
         "abdominal_wall",
         "colon",
         "inferior_mesenteric_artery",
@@ -50,336 +107,225 @@ class DSADDataset(BaseSegmentationDataset):
         "vesicular_glands",
     ]
 
-    REQUIRED_COLUMNS = [
-        "surgery_id",
-        "frame_id",
-        "organ",
-        "image",
-        "mask",
-    ]
-
-    CLASS_NAMES = [
-        "background",
-        "organ",
-    ]
-
-    NUM_CLASSES = 2
+    OFFICIAL_SPLITS = {
+        "train": "train.parquet",
+        "validation": "validation.parquet",
+        "test": "test.parquet",
+    }
 
     def __init__(
         self,
         root: str,
+        variant: str = "single_organ",
         transform=None,
     ):
-        super().__init__(root=root, transform=transform)
+        super().__init__(
+            root=root,
+            transform=transform,
+        )
 
-        self.root = Path(root)
-        self.data_root = self.root / self.VARIANT
-
-        if not self.data_root.exists():
-            raise FileNotFoundError(
-                f"DSAD variant directory not found: {self.data_root}"
+        if variant not in self.SUPPORTED_VARIANTS:
+            raise ValueError(
+                f"Unsupported DSAD variant: {variant}. "
+                f"Available: {self.SUPPORTED_VARIANTS}"
             )
 
-        self.samples = self._load_parquet_splits()
+        self.variant = variant
+        self.root = Path(root) / variant
+
+        if self.variant == "single_organ":
+            self.CLASS_NAMES = self.SINGLE_ORGAN_CLASS_NAMES.copy()
+        else:
+            self.CLASS_NAMES = self.MULTI_ORGAN_CLASS_NAMES.copy()
+
+        self.samples = self._load_samples()
 
         self._validate_dataset()
 
-    # ------------------------------------------------------------------
-    # Dataset loading
-    # ------------------------------------------------------------------
+    def _load_samples(self):
+        """Load all official DSAD parquet splits."""
 
-    def _load_parquet_splits(self) -> pd.DataFrame:
-        """
-        Load train/validation/test parquet files and concatenate them.
+        samples = []
 
-        An additional `_official_split` column keeps track of the
-        original DSAD split.
-        """
-
-        dataframes = []
-
-        for split in ["train", "validation", "test"]:
-            path = self.data_root / f"{split}.parquet"
+        for split_name, filename in self.OFFICIAL_SPLITS.items():
+            path = self.root / filename
 
             if not path.exists():
-                raise FileNotFoundError(
-                    f"Missing DSAD split file: {path}"
-                )
+                raise FileNotFoundError(f"DSAD split not found: {path}")
 
-            df = pd.read_parquet(path).copy()
-            df["_official_split"] = split
+            dataframe = pd.read_parquet(path)
 
-            dataframes.append(df)
-
-        samples = pd.concat(
-            dataframes,
-            ignore_index=True,
-        )
+            for _, row in dataframe.iterrows():
+                sample = row.to_dict()
+                sample["split"] = split_name
+                samples.append(sample)
 
         return samples
 
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _decode_image(value):
+        """Decode an image stored as bytes or return it if already decoded."""
 
-    def _validate_dataset(self):
-        """Validate the structure and official split."""
+        if isinstance(value, bytes):
+            return np.array(Image.open(BytesIO(value)).convert("RGB"))
 
-        missing = [
-            column
-            for column in self.REQUIRED_COLUMNS
-            if column not in self.samples.columns
-        ]
+        if isinstance(value, Image.Image):
+            return np.array(value.convert("RGB"))
 
-        if missing:
-            raise ValueError(
-                f"Missing required columns: {missing}"
-            )
+        return np.asarray(value)
 
-        # Normalize identifiers to strings.
-        self.samples["surgery_id"] = (
-            self.samples["surgery_id"]
-            .astype(str)
-            .str.zfill(2)
-        )
+    @staticmethod
+    def _decode_mask(value):
+        """Decode a binary mask stored as bytes or return it if already decoded."""
 
-        self.samples["frame_id"] = (
-            self.samples["frame_id"]
-            .astype(str)
-        )
+        if isinstance(value, bytes):
+            return np.array(Image.open(BytesIO(value)).convert("L"))
 
-        # Check organs.
-        unknown_organs = set(
-            self.samples["organ"].unique()
-        ) - set(self.ORGAN_COLUMNS)
+        if isinstance(value, Image.Image):
+            return np.array(value.convert("L"))
 
-        if unknown_organs:
-            raise ValueError(
-                f"Unknown organs found in DSAD: {unknown_organs}"
-            )
+        return np.asarray(value)
 
-        # Check official split leakage.
-        split_surgeries = {
-            split: set(
-                self.samples.loc[
-                    self.samples["_official_split"] == split,
-                    "surgery_id",
-                ].unique()
-            )
-            for split in ["train", "validation", "test"]
-        }
+    def _load_single_organ_sample(self, sample):
+        """Load a single-organ DSAD sample."""
 
-        train_ids = split_surgeries["train"]
-        val_ids = split_surgeries["validation"]
-        test_ids = split_surgeries["test"]
+        image = self._decode_image(sample["image"])
+        mask = self._decode_mask(sample["mask"])
 
-        if train_ids & val_ids:
-            raise ValueError(
-                f"Surgery leakage between train and validation: "
-                f"{train_ids & val_ids}"
-            )
-
-        if train_ids & test_ids:
-            raise ValueError(
-                f"Surgery leakage between train and test: "
-                f"{train_ids & test_ids}"
-            )
-
-        if val_ids & test_ids:
-            raise ValueError(
-                f"Surgery leakage between validation and test: "
-                f"{val_ids & test_ids}"
-            )
-
-    # ------------------------------------------------------------------
-    # Basic dataset interface
-    # ------------------------------------------------------------------
-
-    def __len__(self):
-        return len(self.samples)
-
-    def _load_sample(self, index):
-        row = self.samples.iloc[index]
-
-        # --------------------------------------------------------------
-        # Image
-        # --------------------------------------------------------------
-
-        image_bytes = row["image"]["bytes"]
-
-        with Image.open(BytesIO(image_bytes)) as image:
-            image = np.array(
-                image.convert("RGB")
-            )
-
-        # --------------------------------------------------------------
-        # Mask
-        # --------------------------------------------------------------
-
-        mask_bytes = row["mask"]["bytes"]
-
-        with Image.open(BytesIO(mask_bytes)) as mask:
-            mask = np.array(mask)
-
-        # DSAD single_organ:
-        # 0   -> background
-        # 255 -> target organ
-        mask = (mask > 0).astype(np.uint8)
-
-        # --------------------------------------------------------------
-        # Sanity check
-        # --------------------------------------------------------------
-
-        if image.shape[:2] != mask.shape[:2]:
-            raise ValueError(
-                f"Image/mask size mismatch at index {index}: "
-                f"image={image.shape}, mask={mask.shape}"
-            )
-
-        # --------------------------------------------------------------
-        # Organ presence metadata
-        # --------------------------------------------------------------
-
-        organ_presence = {
-            organ: bool(row[organ])
-            for organ in self.ORGAN_COLUMNS
-        }
+        mask = (mask > 0).astype(np.int64)
 
         return {
             "image": image,
             "mask": mask,
-
-            # Metadata
-            "organ": str(row["organ"]),
-            "surgery_id": str(row["surgery_id"]),
-            "frame_id": str(row["frame_id"]),
-            "official_split": str(row["_official_split"]),
-
-            "organ_presence": organ_presence,
+            "surgery_id": str(sample["surgery_id"]),
+            "frame_id": sample["frame_id"],
+            "organ": sample["organ"],
         }
 
-    # ------------------------------------------------------------------
-    # Official split
-    # ------------------------------------------------------------------
+    def _load_multi_organ_sample(self, sample):
+        """Load a multi-organ DSAD sample."""
 
-    def create_official_split(self):
-        """
-        Return the official DSAD train/validation/test splits.
+        image = self._decode_image(sample["image"])
 
-        The split is based on the surgery IDs already provided by DSAD.
-        """
+        masks = []
 
-        train_indices = self.samples.index[
-            self.samples["_official_split"] == "train"
-        ].tolist()
+        for column in self.MULTI_ORGAN_COLUMNS:
+            masks.append(self._decode_mask(sample[f"mask_{column}"]) > 0)
 
-        val_indices = self.samples.index[
-            self.samples["_official_split"] == "validation"
-        ].tolist()
+        masks = np.stack(masks, axis=0)
 
-        test_indices = self.samples.index[
-            self.samples["_official_split"] == "test"
-        ].tolist()
+        mask = np.zeros(masks.shape[1:], dtype=np.int64)
 
-        return (
-            Subset(self, train_indices),
-            Subset(self, val_indices),
-            Subset(self, test_indices),
-        )
+        for class_id, organ_mask in enumerate(masks, start=1):
+            mask[organ_mask] = class_id
 
-    # ------------------------------------------------------------------
-    # Custom surgery-level split
-    # ------------------------------------------------------------------
+        return {
+            "image": image,
+            "mask": mask,
+            "surgery_id": str(sample["surgery_id"]),
+            "frame_id": sample["frame_id"],
+        }
+
+    def _load_sample(self, index):
+        """Load one sample."""
+        
+        sample = self.samples[index]
+
+        if self.variant == "single_organ":
+            return self._load_single_organ_sample(sample)
+
+        return self._load_multi_organ_sample(sample)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _validate_dataset(self):
+        """Validate the official DSAD split."""
+
+        required_splits = set(self.OFFICIAL_SPLITS)
+
+        available_splits = {sample["split"] for sample in self.samples}
+
+        missing_splits = required_splits - available_splits
+
+        if missing_splits:
+            raise ValueError(f"Missing DSAD splits: {missing_splits}")
+
+        split_surgeries = {}
+
+        for split_name in required_splits:
+            split_surgeries[split_name] = {
+                sample["surgery_id"]
+                for sample in self.samples
+                if sample["split"] == split_name
+            }
+
+        for split_a, surgeries_a in split_surgeries.items():
+            for split_b, surgeries_b in split_surgeries.items():
+                if split_a >= split_b:
+                    continue
+
+                overlap = surgeries_a & surgeries_b
+
+                if overlap:
+                    raise ValueError(
+                        f"Surgery leakage between {split_a} and {split_b}: {sorted(overlap)}"
+                    )
 
     def create_split(
         self,
-        train_surgeries: Sequence[str],
-        val_surgeries: Sequence[str],
-        test_surgeries: Sequence[str],
+        strategy: str,
+        group_by: str = "surgery",
+        **kwargs,
     ):
         """
-        Create custom train/validation/test splits at surgery level.
+        Create the DSAD train/validation/test split.
 
-        This is useful when reproducing a specific paper that uses
-        a different DSAD split.
-
-        No surgery can appear in more than one split.
+        DSAD uses its official split, so no new percentage split
+        or stratification is performed.
         """
 
-        train_surgeries = {
-            str(x).zfill(2)
-            for x in train_surgeries
-        }
+        if strategy != "official":
+            raise ValueError("DSAD only supports the official split.")
 
-        val_surgeries = {
-            str(x).zfill(2)
-            for x in val_surgeries
-        }
+        if group_by != "surgery":
+            raise ValueError("DSAD official split must use group_by='surgery'.")
 
-        test_surgeries = {
-            str(x).zfill(2)
-            for x in test_surgeries
-        }
-
-        # --------------------------------------------------------------
-        # Check overlap
-        # --------------------------------------------------------------
-
-        train_val = train_surgeries & val_surgeries
-        train_test = train_surgeries & test_surgeries
-        val_test = val_surgeries & test_surgeries
-
-        if train_val:
+        if kwargs:
+            unexpected = ", ".join(kwargs.keys())
             raise ValueError(
-                f"Train/validation surgery overlap: {train_val}"
+                f"Unexpected arguments for DSAD official split: {unexpected}"
             )
 
-        if train_test:
-            raise ValueError(
-                f"Train/test surgery overlap: {train_test}"
-            )
+        train_indices = [
+            index
+            for index, sample in enumerate(self.samples)
+            if sample["split"] == "train"
+        ]
 
-        if val_test:
-            raise ValueError(
-                f"Validation/test surgery overlap: {val_test}"
-            )
+        val_indices = [
+            index
+            for index, sample in enumerate(self.samples)
+            if sample["split"] == "validation"
+        ]
 
-        # --------------------------------------------------------------
-        # Check unknown surgery IDs
-        # --------------------------------------------------------------
+        test_indices = [
+            index
+            for index, sample in enumerate(self.samples)
+            if sample["split"] == "test"
+        ]
 
-        available_surgeries = set(
-            self.samples["surgery_id"].unique()
+        train_surgeries = self._get_surgeries(train_indices)
+        val_surgeries = self._get_surgeries(val_indices)
+        test_surgeries = self._get_surgeries(test_indices)
+
+        self.log_split(
+            train_groups=train_surgeries,
+            val_groups=val_surgeries,
+            test_groups=test_surgeries,
+            group_key="surgery_id",
         )
-
-        requested_surgeries = (
-            train_surgeries
-            | val_surgeries
-            | test_surgeries
-        )
-
-        unknown = requested_surgeries - available_surgeries
-
-        if unknown:
-            raise ValueError(
-                f"Unknown surgery IDs: {sorted(unknown)}"
-            )
-
-        # --------------------------------------------------------------
-        # Build indices
-        # --------------------------------------------------------------
-
-        train_indices = self.samples.index[
-            self.samples["surgery_id"].isin(train_surgeries)
-        ].tolist()
-
-        val_indices = self.samples.index[
-            self.samples["surgery_id"].isin(val_surgeries)
-        ].tolist()
-
-        test_indices = self.samples.index[
-            self.samples["surgery_id"].isin(test_surgeries)
-        ].tolist()
+        
 
         return (
             Subset(self, train_indices),
@@ -387,76 +333,7 @@ class DSADDataset(BaseSegmentationDataset):
             Subset(self, test_indices),
         )
 
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
+    def _get_surgeries(self, indices):
+        """Return unique surgery IDs for a set of samples."""
 
-    def get_surgery_ids(self):
-        """Return all surgery IDs in the dataset."""
-
-        return sorted(
-            self.samples["surgery_id"].unique()
-        )
-
-    def get_official_surgery_ids(self):
-        """Return surgery IDs grouped by official split."""
-
-        return {
-            split: sorted(
-                self.samples.loc[
-                    self.samples["_official_split"] == split,
-                    "surgery_id",
-                ].unique()
-            )
-            for split in [
-                "train",
-                "validation",
-                "test",
-            ]
-        }
-
-    def summary(self):
-        """Print a compact dataset summary."""
-
-        print("=" * 70)
-        print("DSAD - SINGLE ORGAN")
-        print("=" * 70)
-
-        print(f"Total samples: {len(self)}")
-        print(
-            f"Number of surgeries: "
-            f"{self.samples['surgery_id'].nunique()}"
-        )
-
-        print("\nOfficial splits:")
-
-        for split, surgery_ids in self.get_official_surgery_ids().items():
-
-            num_samples = int(
-                (
-                    self.samples["_official_split"] == split
-                ).sum()
-            )
-
-            print(
-                f"  {split:12s}: "
-                f"{num_samples:5d} samples | "
-                f"{len(surgery_ids):2d} surgeries"
-            )
-
-            print(
-                f"               {surgery_ids}"
-            )
-
-        print("\nOrgans:")
-
-        organ_counts = (
-            self.samples["organ"]
-            .value_counts()
-            .sort_index()
-        )
-
-        for organ, count in organ_counts.items():
-            print(
-                f"  {organ:30s}: {count:5d}"
-            )
+        return sorted({self.samples[index]["surgery_id"] for index in indices})

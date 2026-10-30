@@ -1,0 +1,85 @@
+# @package _global_
+
+train:
+
+  batch_size: 4
+  accumulation_steps: 1
+
+  max_epochs: 50
+  eval_freq: 1
+
+  num_workers: 4
+  pin_memory: true
+
+  precision: "16-mixed"
+
+  initialization: scratch
+
+  early_stopping:
+    enabled: true
+    patience: 10
+    monitor: loss
+    mode: min
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1.0e-4
+    weight_decay: 1.0e-5
+
+  scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: ${train.max_epochs}
+
+  scaler:
+    _target_: torch.cuda.amp.GradScaler
+
+  loss:
+    _target_: monai.losses.DiceFocalLoss
+    include_background: true
+    to_onehot_y: true
+    softmax: true
+    gamma: 1.0
+    lambda_dice: 0.5
+    lambda_focal: 0.5
+    reduction: mean
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+evaluation:
+
+  metrics:
+
+    dice:
+      _target_: monai.metrics.DiceMetric
+      include_background: true
+      reduction: mean
+
+    iou:
+      _target_: monai.metrics.MeanIoU
+      include_background: true
+      reduction: mean
+
+    hd95:
+      _target_: monai.metrics.HausdorffDistanceMetric
+      include_background: true
+      percentile: 95
+      reduction: mean
+
+  foreground_only: false
+  save_predictions: false
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging:
+
+  experiment_name: dsad_baseline
+
+  tags:
+    - dsad
+    - baseline
