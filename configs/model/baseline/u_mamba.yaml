@@ -1,23 +1,59 @@
 name: U-Mamba
-family: mamba
+family: state_space
 task: semantic_segmentation
 
 implementation:
-  source: official
-  # https://github.com/bowang-lab/U-Mamba
-  repository: bowang-lab/U-Mamba
-  framework: nnunet
+  framework: nnunetv2
+  class: UMambaBot
 
 architecture:
-  name: U-Mamba_Bot
-  dimensionality: 2d
+  _target_: src.models.umamba_adapter.UMambaWrapper
 
-  trainer:
-    name: nnUNetTrainerUMambaBot
-
-  configuration: 2d
-
+  input_channels: 3
   num_classes: ${data.num_classes}
+
+  n_stages: 6
+
+  features_per_stage:
+    - 32
+    - 64
+    - 128
+    - 256
+    - 320
+    - 320
+
+  kernel_sizes:
+    - [3, 3]
+    - [3, 3]
+    - [3, 3]
+    - [3, 3]
+    - [3, 3]
+    - [3, 3]
+
+  strides:
+    - [1, 1]
+    - [2, 2]
+    - [2, 2]
+    - [2, 2]
+    - [2, 2]
+    - [2, 2]
+
+  n_conv_per_stage:
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+
+  n_conv_per_stage_decoder:
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+
+  deep_supervision: false
 
 pretrained:
   enabled: false
