@@ -328,7 +328,7 @@ class Trainer:
             except Exception:
                 pass
 
-        self.logger.log(metrics, step=epoch)
+        self.logger.log_metrics(metrics, step=epoch, commit=True)
 
         # Per-class metric names
         num_classes = int(self.cfg.data.num_classes)
@@ -360,12 +360,12 @@ class Trainer:
         images = images.detach().cpu()
         masks = masks.detach().cpu()
 
-        self.logger.log_qualitative(
+        self.logger.log_qualitative_masks(
             images=images,
-            masks=masks,
+            labels=masks,
             predictions=predictions,
             class_labels=class_labels,
-            step=epoch,
+            epoch=epoch,
         )
 
     # Training loop

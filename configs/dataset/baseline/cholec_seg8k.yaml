@@ -22,9 +22,9 @@ data:
 
     stratified: true #https://medium.com/gumgum-tech/creating-balanced-multi-label-datasets-for-model-training-and-evaluation-16b6a3a2d912
 
-    train: 70
-    validation: 10
-    test: 20
+    train_ratio: 0.7
+    val_ratio: 0.3
+    test_ratio: 0.0
 
 # ============================================================
 # PREPROCESSING

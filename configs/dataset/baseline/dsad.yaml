@@ -22,7 +22,7 @@ data:
 
   split:
     strategy: official
-
+    group_by: surgery
     stratified: false
 
 
