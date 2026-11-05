@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 
 class Trainer:
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -24,6 +25,7 @@ class Trainer:
         device: torch.device,
         logger: Any | None = None,
     ) -> None:
+
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -80,7 +82,7 @@ class Trainer:
         images: torch.Tensor,
         masks: torch.Tensor | None = None,
         training: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Forward pass.
         Returns:
@@ -97,10 +99,11 @@ class Trainer:
                     raise RuntimeError("Mask2Former did not return a training loss.")
 
                 logits = getattr(outputs, "logits", None)
-                if logits is None:
-                    raise RuntimeError("Mask2Former did not return logits.")
+                #if logits is None:
+                #    raise RuntimeError("Mask2Former did not return logits.")
 
-                return logits, loss
+                # During training, Mask2Former computes the loss internally.
+                return None, loss
 
             outputs = self.model(pixel_values=images)
             logits = getattr(outputs, "logits", None)
@@ -123,8 +126,27 @@ class Trainer:
         self,
         batch: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+    
         images = batch["image"].to(self.device, non_blocking=True)
         masks = batch["mask"].to(self.device, non_blocking=True)
+
+        # Semantic segmentation masks:
+        # [B, H, W] -> [B, 1, H, W]
+        if masks.ndim == 3:
+            masks = masks.unsqueeze(1)
+
+        if masks.ndim != 4:
+            raise ValueError(
+                f"Invalid mask shape: {tuple(masks.shape)}. "
+                "Expected [B, 1, H, W] for multiclass semantic segmentation."
+            )
+
+        if masks.shape[1] != 1:
+            raise ValueError(
+                f"Invalid mask channel dimension: {tuple(masks.shape)}. "
+                "Expected [B, 1, H, W], not one-hot [B, C, H, W]."
+            )
+
         return images, masks
 
     # AMP
@@ -138,7 +160,10 @@ class Trainer:
         self,
         epoch: int,
     ) -> dict[str, float]:
+
         self.model.train()
+        self.metric_manager.reset()
+
         total_loss = 0.0
         num_batches = 0
 
@@ -149,12 +174,17 @@ class Trainer:
             images, masks = self._prepare_batch(batch)
 
             with self._autocast():
-                _, loss = self._forward(images, masks, training=True)
-
+                logits, loss = self._forward(images, masks, training=True)
                 if loss is None:
                     raise RuntimeError("Training loss is None.")
-
                 loss_for_backward = loss / self.accumulation_steps
+
+            # ---- Update per‑class metrics for training ----
+            if logits is not None:
+                self.metric_manager.update(
+                    logits.detach(),
+                    masks.detach(),
+                )
 
             if self.scaler is not None:
                 self.scaler.scale(loss_for_backward).backward()
@@ -180,18 +210,30 @@ class Trainer:
             loss_value = float(loss.detach().item())
             total_loss += loss_value
             num_batches += 1
-
             progress.set_postfix(loss=f"{loss_value:.4f}")
 
-        return {"loss": total_loss / max(num_batches, 1)}
+        # Compute per‑class training metrics and reset for validation
+        train_metrics = self.metric_manager.compute()
+        train_per_class = self.metric_manager.compute_per_class()
+        
+        self.metric_manager.reset()
+
+        return {
+            "loss": total_loss / max(num_batches, 1), 
+            **train_metrics,
+            **train_per_class
+        }
+
 
     # Validation
     def validate(
         self,
         epoch: int,
     ) -> tuple[dict[str, float], dict[str, float], dict[str, torch.Tensor] | None]:
+
         self.model.eval()
         self.metric_manager.reset()
+
         total_loss = 0.0
         num_batches = 0
         total_images = 0
@@ -250,6 +292,7 @@ class Trainer:
         epoch: int,
         metrics: dict[str, float],
     ) -> None:
+        
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
@@ -265,7 +308,22 @@ class Trainer:
         if self.scaler is not None:
             checkpoint["scaler_state_dict"] = self.scaler.state_dict()
 
-        torch.save(checkpoint, path)
+        if self.logger is not None:
+
+            self.logger.log_checkpoint(
+                checkpoint=checkpoint,
+                checkpoint_path=path,
+                name="model",
+                aliases=[
+                    f"epoch-{epoch}",
+                    "latest",
+                ],
+            )
+
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(checkpoint, path)
+
 
     # Early stopping
     def _is_improvement(self, score: float) -> bool:
@@ -307,6 +365,8 @@ class Trainer:
         per_class_results: dict[str, float],
         qualitative_batch: dict[str, torch.Tensor] | None,
     ) -> None:
+
+
         if self.logger is None:
             return
 

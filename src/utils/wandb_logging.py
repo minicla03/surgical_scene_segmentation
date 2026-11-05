@@ -6,6 +6,8 @@ import numpy as np
 import torch
 import wandb
 
+from pathlib import Path
+
 
 class WandbLogger:
     def __init__(
@@ -75,13 +77,7 @@ class WandbLogger:
 
         if metrics:
             for name, value in metrics.items():
-                # MetricManager può già fornire:
-                #   dice
-                #   dice/kidney
-                #   iou/liver
-                #
-                # Qui aggiungiamo semplicemente il prefisso val/
-                # senza modificare il nome della metrica.
+                
                 metric_name = name if name.startswith("val/") else f"val/{name}"
                 log_dict[metric_name] = value
 
@@ -216,16 +212,34 @@ class WandbLogger:
     # Checkpoint
     def log_checkpoint(
         self,
-        checkpoint_path: str,
+        checkpoint: dict,
+        checkpoint_path: str | Path,
         name: str = "model",
         aliases: list[str] | None = None,
     ) -> None:
+
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        # save locally.
+        torch.save(checkpoint, checkpoint_path)
+
         if not self.is_active:
             return
 
-        artifact = wandb.Artifact(name=name, type="model")
-        artifact.add_file(checkpoint_path)
-        wandb.log_artifact(artifact, aliases=aliases or [])
+        artifact = wandb.Artifact(
+            name=name,
+            type="model",
+        )
+        artifact.add_file(str(checkpoint_path))
+
+        wandb.log_artifact(
+            artifact,
+            aliases=aliases or ["latest"],
+        )
 
     # Model information
     def log_model_info(
