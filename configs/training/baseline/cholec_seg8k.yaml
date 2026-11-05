@@ -13,8 +13,8 @@ train:
   early_stopping:
     enabled: true
     patience: 10
-    monitor: loss
-    mode: min
+    monitor: dice
+    mode: max
 
   optimizer:
     _target_: torch.optim.AdamW

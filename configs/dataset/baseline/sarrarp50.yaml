@@ -24,7 +24,7 @@ data:
 preprocessing:
 
   image:
-    size: [384, 480]
+    size: [480, 640]
     channel_first: true
     dtype: float32
     normalize: true
