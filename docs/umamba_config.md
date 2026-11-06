@@ -38,23 +38,7 @@ Additional build dependencies:
 pip install packaging ninja
 ```
 
-The relevant environment configuration is approximately:
-
-```yaml
-name: umamba
-channels:
-  - conda-forge
-
-dependencies:
-  - python=3.10
-  - pip
-  - pip:
-      - --extra-index-url https://download.pytorch.org/whl/cu118
-      - torch==2.0.1+cu118
-      - torchvision==0.15.2+cu118
-      - packaging
-      - ninja
-```
+The relevant environment configuration can be find into the repo: docs/env_umamba.yaml
 
 ---
 
