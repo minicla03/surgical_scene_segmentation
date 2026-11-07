@@ -378,6 +378,7 @@ class WandbLogger:
         train_metrics: dict[str, float],
         val_metrics: dict[str, float],
         per_class_metrics: dict[str, float] | None = None,
+        train_per_class_metrics: dict[str, float] | None = None,
         learning_rate: float | None = None,
         qualitative_batch: dict[str, torch.Tensor] | None = None,
         class_labels: dict[int, str] | None = None,
@@ -399,6 +400,14 @@ class WandbLogger:
                 for key, value in val_metrics.items()
             }
         )
+
+        if train_per_class_metrics:
+            metrics.update(
+                {
+                    f"train/{key}": value
+                    for key, value in train_per_class_metrics.items()
+                }
+            )
 
         if per_class_metrics:
             metrics.update(

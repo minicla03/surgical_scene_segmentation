@@ -343,18 +343,23 @@ class Trainer:
         epoch: int,
         train_metrics: dict[str, float],
         val_metrics: dict[str, float],
-        per_class: dict[str, float],
-        qualitative_batch: dict[str, torch.Tensor] | None,
+        val_per_class: dict[str, float] | None = None,
+        train_per_class: dict[str, float] | None = None,
+        qualitative_batch: dict[str, torch.Tensor] | None = None,
+        per_class: dict[str, float] | None = None,
     ) -> None:
 
         if self.logger is None:
             return
 
+        val_per_class_metrics = val_per_class if val_per_class is not None else per_class
+
         self.logger.log_epoch(
             epoch=epoch,
             train_metrics=train_metrics,
             val_metrics=val_metrics,
-            per_class_metrics=per_class,
+            per_class_metrics=val_per_class_metrics,
+            train_per_class_metrics=train_per_class,
             learning_rate=self.optimizer.param_groups[0]["lr"],
             qualitative_batch=qualitative_batch,
             class_labels=self.class_labels,
@@ -383,7 +388,8 @@ class Trainer:
                     epoch=epoch,
                     train_metrics=train_metrics,
                     val_metrics=val_metrics,
-                    per_class=per_class_results,
+                    val_per_class=per_class_results,
+                    train_per_class=train_per_class,
                     qualitative_batch=qualitative_batch,
                 )
 
@@ -397,7 +403,9 @@ class Trainer:
                     "epoch": epoch,
                     "train": train_metrics,
                     "val": val_metrics,
+                    "train_per_class": train_per_class,
                     "per_class": per_class_results,
+                    "val_per_class": per_class_results,
                     "epoch_time": epoch_time,
                 }
                 history.append(epoch_results)
@@ -422,6 +430,7 @@ class Trainer:
                 epoch_results = {
                     "epoch": epoch,
                     "train": train_metrics,
+                    "train_per_class": train_per_class,
                     "epoch_time": epoch_time,
                 }
                 history.append(epoch_results)

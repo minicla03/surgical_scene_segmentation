@@ -244,36 +244,36 @@ def main(cfg: DictConfig):
         # ==============================================================
         # 14. Optional final test
         # ==============================================================
-        test_results = {}
-
-        if test_loader is not None:
-            log_step(14, "Starting final test evaluation...")
-
-            # ----------------------------------------------------------
-            # IMPORTANT: Use a fresh MetricManager for the test set.
-            # ----------------------------------------------------------
-            test_metrics = {name: instantiate(metric_cfg) for name, metric_cfg in cfg.evaluation.metrics.items()}
-            test_metric_manager = MetricManager(
-                metrics=test_metrics,
-                num_classes=num_classes,
-                dataset_name=cfg.data.name,
-                class_names=class_names,
-            )
-
-            tester = Tester(
-                model=model,
-                test_loader=test_loader,
-                metric_manager=test_metric_manager,
-                loss_fn=loss_fn,
-                cfg=cfg,
-                device=device,
-                logger=logger,
-            )
-
-            test_results = tester.test()
-            log_step(14, "Final test evaluation completed.")
-        else:
-            print("\nTest evaluation skipped: no test dataset available.", flush=True)
+        #test_results = {}
+#
+        #if test_loader is not None:
+        #    log_step(14, "Starting final test evaluation...")
+#
+        #    # ----------------------------------------------------------
+        #    # IMPORTANT: Use a fresh MetricManager for the test set.
+        #    # ----------------------------------------------------------
+        #    test_metrics = {name: instantiate(metric_cfg) for name, metric_cfg in cfg.evaluation.metrics.items()}
+        #    test_metric_manager = MetricManager(
+        #        metrics=test_metrics,
+        #        num_classes=num_classes,
+        #        dataset_name=cfg.data.name,
+        #        class_names=class_names,
+        #    )
+#
+        #    tester = Tester(
+        #        model=model,
+        #        test_loader=test_loader,
+        #        metric_manager=test_metric_manager,
+        #        loss_fn=loss_fn,
+        #        cfg=cfg,
+        #        device=device,
+        #        logger=logger,
+        #    )
+#
+        #    test_results = tester.test()
+        #    log_step(14, "Final test evaluation completed.")
+        #else:
+        #    print("\nTest evaluation skipped: no test dataset available.", flush=True)
 
         # ==============================================================
         # 15. Final results
