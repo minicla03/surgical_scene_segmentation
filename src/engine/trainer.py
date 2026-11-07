@@ -172,13 +172,13 @@ class Trainer:
             with self._autocast():
                 predictions, loss = self._forward(images, masks)
 
-            if loss is None:
-                if self.loss_fn is None:
-                    raise RuntimeError(
-                        "Model returned no loss and no loss function is configured."
-                    )
+                if loss is None:
+                    if self.loss_fn is None:
+                        raise RuntimeError(
+                            "Model returned no loss and no loss function is configured."
+                        )
 
-                loss = self.loss_fn(predictions, masks)
+                    loss = self.loss_fn(predictions, masks)
 
             loss_for_backward = loss / self.accumulation_steps
 
@@ -229,10 +229,10 @@ class Trainer:
             with self._autocast():
                 predictions, loss = self._forward(images, masks)
 
-            if loss is None:
-                if self.loss_fn is None:
-                    raise RuntimeError("Model returned no loss and no loss function is configured.")
-                loss = self.loss_fn(predictions, masks)
+                if loss is None:
+                    if self.loss_fn is None:
+                        raise RuntimeError("Model returned no loss and no loss function is configured.")
+                    loss = self.loss_fn(predictions, masks)
 
             self.metric_manager.update(predictions.detach(), masks.detach())
 
