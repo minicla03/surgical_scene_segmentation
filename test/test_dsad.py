@@ -1,242 +1,161 @@
+"""
+Smoke tests and sanity checks for Trainer pipeline, batch formatting, and metrics.
+"""
 from __future__ import annotations
 
+import pytest
 import torch
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader, Dataset
+
+from src.engine.trainer import Trainer
+from src.metrics.metric_manager import MetricManager
 
 
-def run_smoke_test(trainer) -> None:
-    """
-    Esegue un test minimale di train e validation.
+class DummySegmentationDataset(Dataset):
+    """Synthetic dataset producing well-formed segmentation pairs."""
 
-    Verifica:
-    - shape immagini e mask
-    - dtype delle mask
-    - classi presenti nelle mask
-    - forward
-    - loss
-    - backward
-    - optimizer step
-    - validation
-    - metriche
-    - compatibilità num_classes
-    """
+    def __init__(self, num_samples: int = 4, num_classes: int = 8, size=(64, 64)):
+        self.num_samples = num_samples
+        self.num_classes = num_classes
+        self.size = size
 
-    print("\n" + "=" * 70)
-    print("SMOKE TEST - TRAIN + VALIDATION")
-    print("=" * 70)
+    def __len__(self):
+        return self.num_samples
 
-    expected_classes = int(trainer.cfg.data.num_classes)
+    def __getitem__(self, idx: int):
+        h, w = self.size
+        image = torch.randn(3, h, w, dtype=torch.float32)
+        mask = torch.randint(0, self.num_classes, (1, h, w), dtype=torch.long)
+        return {"image": image, "mask": mask}
 
-    # ============================================================
-    # TRAIN - 1 batch
-    # ============================================================
-    trainer.model.train()
-    trainer.optimizer.zero_grad(set_to_none=True)
 
-    train_batch = next(iter(trainer.train_loader))
-    images, masks = trainer._prepare_batch(train_batch)
+class DummySegmentationModel(torch.nn.Module):
+    """Minimal CNN outputting logits [B, C, H, W] for testing trainer mechanics."""
 
-    _check_batch(
-        images=images,
-        masks=masks,
-        expected_classes=expected_classes,
-        stage="TRAIN",
+    def __init__(self, num_classes: int = 8):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, num_classes, kernel_size=1)
+
+    def forward(self, x, labels=None):
+        logits = self.conv(x)
+        if labels is not None:
+            # Mask [B, 1, H, W] -> [B, H, W]
+            target = labels.squeeze(1) if labels.ndim == 4 else labels
+            loss = torch.nn.functional.cross_entropy(logits, target)
+            return type("ModelOutput", (), {"logits": logits, "loss": loss})()
+        return logits
+
+
+@pytest.fixture
+def minimal_trainer(device):
+    """Instantiate a minimal but fully functional Trainer instance."""
+    num_classes = 8
+    model = DummySegmentationModel(num_classes=num_classes)
+    train_ds = DummySegmentationDataset(num_samples=4, num_classes=num_classes)
+    val_ds = DummySegmentationDataset(num_samples=2, num_classes=num_classes)
+
+    train_loader = DataLoader(train_ds, batch_size=2)
+    val_loader = DataLoader(val_ds, batch_size=2)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+    loss_fn = torch.nn.CrossEntropyLoss()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler(device.type, enabled=False)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
+
+    metric_manager = MetricManager(
+        metrics={},
+        num_classes=num_classes,
+        class_names={i: f"cls_{i}" for i in range(num_classes)},
     )
 
-    with trainer._autocast():
-        logits, loss = trainer._forward(
-            images,
-            masks,
-            training=True,
-        )
+    cfg = OmegaConf.create({
+        "data": {"name": "dsad", "num_classes": num_classes},
+        "model": {"name": "dummy_model"},
+        "output_dir": "/tmp/test_trainer_outputs",
+        "train": {
+            "max_epochs": 1,
+            "accumulation_steps": 1,
+            "eval_freq": 1,
+            "early_stopping": {"enabled": False, "patience": 5, "monitor": "loss", "mode": "min"},
+        },
+        "logging": {"qualitative": {"enabled": False}},
+    })
 
-    _check_logits(
-        logits=logits,
-        expected_classes=expected_classes,
-        stage="TRAIN",
+    return Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        loss_fn=loss_fn,
+        scaler=scaler,
+        metric_manager=metric_manager,
+        cfg=cfg,
+        device=device,
+        logger=None,
     )
 
-    if loss is None:
-        raise RuntimeError("Training loss is None.")
 
-    loss_value = float(loss.detach().item())
+class TestTrainerSmoke:
+    def test_batch_structure(self, minimal_trainer):
+        """Verify train loader outputs correct 4D shapes and dtypes."""
+        batch = next(iter(minimal_trainer.train_loader))
+        images, masks = minimal_trainer._prepare_batch(batch)
 
-    print(f"Logits shape : {tuple(logits.shape)}")
-    print(f"Loss         : {loss_value:.6f}")
+        assert images.ndim == 4, f"Expected [B, C, H, W], got {images.shape}"
+        assert masks.ndim == 4, f"Expected [B, 1, H, W], got {masks.shape}"
+        assert masks.shape[1] == 1, "Mask channel dimension must be 1"
+        assert masks.dtype == torch.long, f"Mask dtype should be torch.long, got {masks.dtype}"
 
-    if not torch.isfinite(loss):
-        raise RuntimeError(
-            f"Training loss is not finite: {loss_value}"
-        )
+        expected_classes = int(minimal_trainer.cfg.data.num_classes)
+        assert masks.min() >= 0, "Negative class index found in mask"
+        assert masks.max() < expected_classes, f"Class index {masks.max()} exceeds num_classes={expected_classes}"
 
-    # Backward
-    loss.backward()
+    def test_train_step(self, minimal_trainer):
+        """Verify forward pass, loss calculation and backward step on trainer."""
+        minimal_trainer.model.train()
+        minimal_trainer.optimizer.zero_grad(set_to_none=True)
 
-    torch.nn.utils.clip_grad_norm_(
-        trainer.model.parameters(),
-        max_norm=1.0,
-    )
+        batch = next(iter(minimal_trainer.train_loader))
+        images, masks = minimal_trainer._prepare_batch(batch)
 
-    trainer.optimizer.step()
-    trainer.optimizer.zero_grad(set_to_none=True)
-
-    print("Backward     : OK")
-    print("Optimizer    : OK")
-
-    # ============================================================
-    # VALIDATION - 1 batch
-    # ============================================================
-    trainer.model.eval()
-    trainer.metric_manager.reset()
-
-    val_batch = next(iter(trainer.val_loader))
-    images, masks = trainer._prepare_batch(val_batch)
-
-    _check_batch(
-        images=images,
-        masks=masks,
-        expected_classes=expected_classes,
-        stage="VALIDATION",
-    )
-
-    with torch.no_grad():
-        with trainer._autocast():
-            logits, model_loss = trainer._forward(
-                images,
-                masks,
-                training=False,
-            )
-
-            loss = model_loss
-
+        with minimal_trainer._autocast():
+            logits, loss = minimal_trainer._forward(images, masks)
             if loss is None:
-                loss = trainer.loss_fn(logits, masks)
+                loss = minimal_trainer.loss_fn(logits, masks.squeeze(1))
 
-    _check_logits(
-        logits=logits,
-        expected_classes=expected_classes,
-        stage="VALIDATION",
-    )
+        assert logits.ndim == 4
+        expected_classes = int(minimal_trainer.cfg.data.num_classes)
+        assert logits.shape[1] == expected_classes
+        assert loss is not None
+        assert torch.isfinite(loss)
 
-    if loss is None:
-        raise RuntimeError("Validation loss is None.")
+        loss.backward()
+        minimal_trainer.optimizer.step()
+        minimal_trainer.optimizer.zero_grad(set_to_none=True)
 
-    val_loss = float(loss.detach().item())
+    def test_validation_step(self, minimal_trainer):
+        """Verify validation forward and metric update without gradient tracking."""
+        minimal_trainer.model.eval()
+        minimal_trainer.metric_manager.reset()
 
-    print(f"Logits shape : {tuple(logits.shape)}")
-    print(f"Loss         : {val_loss:.6f}")
+        batch = next(iter(minimal_trainer.val_loader))
+        images, masks = minimal_trainer._prepare_batch(batch)
 
-    if not torch.isfinite(loss):
-        raise RuntimeError(
-            f"Validation loss is not finite: {val_loss}"
-        )
+        with torch.no_grad():
+            with minimal_trainer._autocast():
+                logits, loss = minimal_trainer._forward(images, masks)
+                if loss is None:
+                    loss = minimal_trainer.loss_fn(logits, masks.squeeze(1))
 
-    # Metrics
-    trainer.metric_manager.update(logits, masks)
-    metrics = trainer.metric_manager.compute()
+        assert logits.ndim == 4
+        assert loss is not None
+        assert torch.isfinite(loss)
 
-    print("\n[METRICS]")
-
-    for name, value in metrics.items():
-        print(f"{name:20s}: {float(value):.6f}")
-
-    print("\n" + "=" * 70)
-    print("SMOKE TEST PASSED")
-    print("=" * 70)
-
-
-def _check_batch(
-    images: torch.Tensor,
-    masks: torch.Tensor,
-    expected_classes: int,
-    stage: str,
-) -> None:
-    print(f"\n[{stage}]")
-
-    print(f"Images shape : {tuple(images.shape)}")
-    print(f"Images dtype : {images.dtype}")
-
-    print(f"Masks shape  : {tuple(masks.shape)}")
-    print(f"Masks dtype  : {masks.dtype}")
-
-    print(f"Mask min     : {masks.min().item()}")
-    print(f"Mask max     : {masks.max().item()}")
-
-    unique_classes = torch.unique(masks).cpu().tolist()
-
-    print(f"Mask classes : {unique_classes}")
-
-    # ------------------------------------------------------------
-    # Images
-    # ------------------------------------------------------------
-    if images.ndim != 4:
-        raise RuntimeError(
-            f"{stage}: expected images [B, C, H, W], "
-            f"got {tuple(images.shape)}"
-        )
-
-    # ------------------------------------------------------------
-    # Masks
-    # ------------------------------------------------------------
-    if masks.ndim != 4:
-        raise RuntimeError(
-            f"{stage}: expected masks [B, 1, H, W], "
-            f"got {tuple(masks.shape)}"
-        )
-
-    if masks.shape[1] != 1:
-        raise RuntimeError(
-            f"{stage}: expected mask channel dimension = 1, "
-            f"got shape {tuple(masks.shape)}"
-        )
-
-    if masks.dtype != torch.long:
-        raise RuntimeError(
-            f"{stage}: expected masks dtype torch.long, "
-            f"got {masks.dtype}"
-        )
-
-    # ------------------------------------------------------------
-    # Class range
-    # ------------------------------------------------------------
-    min_class = int(masks.min().item())
-    max_class = int(masks.max().item())
-
-    if min_class < 0:
-        raise RuntimeError(
-            f"{stage}: mask contains negative class label: "
-            f"{min_class}"
-        )
-
-    if max_class >= expected_classes:
-        raise RuntimeError(
-            f"{stage}: mask contains class {max_class}, "
-            f"but num_classes={expected_classes}."
-        )
-
-
-def _check_logits(
-    logits: torch.Tensor,
-    expected_classes: int,
-    stage: str,
-) -> None:
-    if logits.ndim != 4:
-        raise RuntimeError(
-            f"{stage}: expected logits [B, C, H, W], "
-            f"got {tuple(logits.shape)}"
-        )
-
-    actual_classes = logits.shape[1]
-
-    if actual_classes != expected_classes:
-        raise RuntimeError(
-            f"{stage}: model outputs {actual_classes} classes, "
-            f"but config specifies {expected_classes}."
-        )
-
-    if not torch.isfinite(logits).all():
-        raise RuntimeError(
-            f"{stage}: logits contain NaN or Inf."
-        )
-
-if __name__=="main":
-    run_smoke_test()
+        minimal_trainer.metric_manager.update(logits, masks)
+        metrics = minimal_trainer.metric_manager.compute()
+        assert isinstance(metrics, dict)
