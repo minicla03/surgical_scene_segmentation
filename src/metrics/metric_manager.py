@@ -17,182 +17,141 @@ class MetricManager:
         dataset_name: str | None = None,
         class_names: dict[int, str] | None = None,
     ) -> None:
+
         self.metrics = metrics
         self.num_classes = num_classes
         self.dataset_name = dataset_name
+        self.class_names = class_names or {i: f"class_{i}" for i in range(num_classes)}
+        
+        self.atlas_ap = (
+            SegmentationAPEvaluator() if dataset_name == "atlas120k" else None
+        )
+        self._num_updates = 0
 
-        # Mapping:
-        # class index -> class name
-        #
-        # Example:
-        # {
-        #     0: "background",
-        #     1: "liver",
-        #     2: "kidney",
-        # }
-        if class_names is None:
-            self.class_names = {i: f"class_{i}" for i in range(num_classes)}
-        else:
-            self.class_names = class_names
-
-        # ATLAS-specific AP metrics.
-       
-        self.atlas_ap = None
-
-        if self.dataset_name == "atlas120k":
-            self.atlas_ap = SegmentationAPEvaluator()
-
-    
     @property
     def names(self) -> list[str]:
-        """Return the names of all metrics managed by this class."""
-        names = list(self.metrics.keys())
-
+        names = list(self.metrics)
         if self.atlas_ap is not None:
             names.extend(["AP", "AP50", "AP75"])
-
         return names
-    
+
+    @property
+    def has_data(self) -> bool:
+        return self._num_updates > 0
+
     def reset(self) -> None:
-        """Reset all accumulated metric state."""
         for metric in self.metrics.values():
             metric.reset()
-
         if self.atlas_ap is not None:
             self.atlas_ap = SegmentationAPEvaluator()
+        self._num_updates = 0
 
+    def update(self, predictions: torch.Tensor, targets: torch.Tensor) -> None:
+        predictions = self._class_map(predictions)
+        targets = self._class_map(targets)
 
-    def update(self, logits: torch.Tensor, targets: torch.Tensor) -> None:
-        """
-        Update all metrics using one batch.
-
-        Parameters
-        ----------
-        logits:
-            Model output with shape [B, C, H, W].
-
-        targets:
-            Ground-truth masks with shape [B, H, W]
-            or [B, 1, H, W].
-        """
-
-        # Predictions
-        probabilities = torch.softmax(logits, dim=1)
-        predictions = torch.argmax(probabilities, dim=1, keepdim=True)
-
-        # Targets
-        if targets.ndim == 3:
-            targets = targets.unsqueeze(1)
-
-        # Convert to one-hot
         predictions_one_hot = one_hot(predictions, num_classes=self.num_classes)
         targets_one_hot = one_hot(targets, num_classes=self.num_classes)
-
 
         for metric in self.metrics.values():
             metric(y_pred=predictions_one_hot, y=targets_one_hot)
 
-        # ATLAS AP
+        self._num_updates += 1
+
         if self.atlas_ap is not None:
-            batch_size = logits.shape[0]
+            self._update_atlas(predictions, targets)
 
-            for i in range(batch_size):
-                pred_mask = predictions[i, 0].detach().cpu().numpy()
-                gt_mask = targets[i, 0].detach().cpu().numpy()
+    def _class_map(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 3:
+            return tensor.unsqueeze(1).long()
 
-                # Confidence score based on the average maximum class probability.
-                score = probabilities[i].max(dim=0).values.mean().item()
+        if tensor.ndim != 4:
+            raise ValueError(
+                f"Expected [B,H,W], [B,1,H,W] or [B,C,H,W], got {tuple(tensor.shape)}."
+            )
 
-                self.atlas_ap.add_frame(
-                    gt_mask=gt_mask,
-                    pred_mask=pred_mask,
-                    score=score,
-                )
+        if tensor.shape[1] == 1:
+            return tensor.long()
+
+        if tensor.shape[1] != self.num_classes:
+            raise ValueError(
+                f"Expected 1 or {self.num_classes} channels, got {tensor.shape[1]}."
+            )
+
+        return tensor.argmax(dim=1, keepdim=True).long()
+
+    def _update_atlas(self, predictions: torch.Tensor, targets: torch.Tensor) -> None:
+        for pred, target in zip(predictions, targets):
+            self.atlas_ap.add_frame(
+                gt_mask=target[0].cpu().numpy(),
+                pred_mask=pred[0].cpu().numpy(),
+            )
 
     def compute(self) -> dict[str, float]:
-        """
-        Compute the aggregated value of every metric.
-        """
-        results: dict[str, float] = {}
+        if not self.has_data:
+            return self._empty_metrics()
 
+        results = {}
         for name, metric in self.metrics.items():
             value = metric.aggregate()
 
-            # Some MONAI metrics return tuples.
             if isinstance(value, tuple):
                 value = value[0]
 
             if torch.is_tensor(value):
                 value = value.detach().cpu().nanmean().item()
-            else:
-                value = float(value)
 
-            results[name] = value
+            results[name] = float(value)
 
-        # ATLAS AP metrics
         if self.atlas_ap is not None:
             results.update(self.atlas_ap.evaluate())
 
         return results
 
-    
     def compute_per_class(self) -> dict[str, float]:
-        """
-        Compute metric values for each class.
+        results = {}
 
-        Returns
-        -------
-        dict[str, float]
-            Flat dictionary suitable for logging.
+        for name, metric in self.metrics.items():
+            buffer = self._metric_buffer(metric)
 
-        Example
-        -------
-        {
-            "dice_class_background": 0.92,
-            "dice_class_liver": 0.85,
-            "iou_class_liver": 0.78,
-        }
-
-        Notes
-        -----
-        MONAI metric buffers are expected to have shape:
-
-            [N_samples, N_classes]
-
-        The mean is computed independently for every class.
-
-        Classes whose value is NaN are skipped.
-        """
-        results: dict[str, float] = {}
-
-        for metric_name, metric in self.metrics.items():
-            
-            try:
-                buffer = metric.get_buffer()
-            except AttributeError:
+            if buffer is None:
+                self._add_nan_classes(results, name)
                 continue
 
-            if buffer is None or not torch.is_tensor(buffer):
-                continue
+            values = buffer.float().nanmean(dim=0)
 
-            # Expected:
-            # [N_samples, N_classes]
-            if buffer.ndim < 2:
-                continue
-
-            # Mean over samples
-            per_class = buffer.float().nanmean(dim=0)
-
-
-            for class_idx, value in enumerate(per_class):
-                # Skip NaN classes.
-                if torch.isnan(value):
-                    continue
-
-                class_name = self.class_names.get(class_idx, f"class_{class_idx}")
-
-                class_name = re.sub(r"[^a-zA-Z0-9_]+", "_", class_name).strip("_")
-
-                results[f"{metric_name}_class_{class_name}"] = value.item()
+            for class_idx in range(self.num_classes):
+                value = (
+                    values[class_idx].item() if class_idx < values.shape[0] else float("nan")
+                )
+                results[self._metric_name(name, class_idx)] = value
 
         return results
+
+    def _metric_buffer(self, metric: Any) -> torch.Tensor | None:
+        try:
+            buffer = metric.get_buffer()
+        except AttributeError:
+            return None
+
+        if not torch.is_tensor(buffer) or buffer.ndim < 2:
+            return None
+
+        return buffer
+
+    def _empty_metrics(self) -> dict[str, float]:
+        results = {name: float("nan") for name in self.metrics}
+
+        if self.atlas_ap is not None:
+            results.update({"AP": float("nan"), "AP50": float("nan"), "AP75": float("nan")})
+
+        return results
+
+    def _add_nan_classes(self, results: dict[str, float], metric_name: str) -> None:
+        for class_idx in range(self.num_classes):
+            results[self._metric_name(metric_name, class_idx)] = float("nan")
+
+    def _metric_name(self, metric: str, class_idx: int) -> str:
+        name = self.class_names.get(class_idx, f"class_{class_idx}")
+        name = re.sub(r"[^a-zA-Z0-9_]+", "_", str(name)).strip("_")
+        return f"{metric}_class_{name or class_idx}"

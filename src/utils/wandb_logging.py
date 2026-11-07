@@ -50,6 +50,15 @@ class WandbLogger:
 
         wandb.log(metrics, step=step, commit=commit)
 
+    def log(
+        self,
+        metrics: dict[str, Any],
+        step: int | None = None,
+        commit: bool = False,
+    ) -> None:
+        """Alias for log_metrics."""
+        self.log_metrics(metrics, step=step, commit=commit)
+
     # Epoch metrics
     def log_epoch_metrics(
         self,
@@ -209,6 +218,25 @@ class WandbLogger:
             commit=False,
         )
 
+    def log_qualitative(
+        self,
+        images: torch.Tensor,
+        masks: torch.Tensor,
+        predictions: torch.Tensor,
+        class_labels: dict[int, str] | None = None,
+        epoch: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Alias/wrapper for log_qualitative_masks."""
+        self.log_qualitative_masks(
+            images=images,
+            labels=masks,
+            predictions=predictions,
+            class_labels=class_labels or {},
+            epoch=epoch,
+            **kwargs,
+        )
+
     # Checkpoint
     def log_checkpoint(
         self,
@@ -302,21 +330,35 @@ class WandbLogger:
     def log_final_results(
         self,
         train_results: dict[str, Any],
-        test_results: dict[str, float],
+        test_results: dict[str, Any],
     ) -> None:
         if not self.is_active:
             return
 
         summary: dict[str, Any] = {}
-        best_val = train_results.get("best_val_metrics", {})
+        best_val = train_results.get("best_metrics", train_results.get("best_val_metrics", {}))
 
         for key, value in best_val.items():
-            summary[f"train/best_val_{key}"] = value
+            if isinstance(value, (int, float, np.floating, np.integer)):
+                summary[f"train/best_val_{key}"] = float(value)
 
-        summary["train/best_epoch"] = train_results.get("best_epoch", -1)
+        if "best_epoch" in train_results:
+            summary["train/best_epoch"] = train_results["best_epoch"]
 
-        for key, value in test_results.items():
-            summary[f"test/{key}"] = value
+        if "best_score" in train_results:
+            summary["train/best_score"] = float(train_results["best_score"])
+
+        test_metrics = test_results.get("metrics", test_results)
+        if isinstance(test_metrics, dict):
+            for key, value in test_metrics.items():
+                if isinstance(value, (int, float, np.floating, np.integer)):
+                    summary[f"test/{key}"] = float(value)
+
+        test_per_class = test_results.get("per_class", {})
+        if isinstance(test_per_class, dict):
+            for key, value in test_per_class.items():
+                if isinstance(value, (int, float, np.floating, np.integer)):
+                    summary[f"test/{key}"] = float(value)
 
         if wandb.run is not None:
             for key, value in summary.items():
@@ -328,3 +370,63 @@ class WandbLogger:
         if self.is_active:
             wandb.finish()
             self.is_active = False
+
+
+    def log_epoch(
+        self,
+        epoch: int,
+        train_metrics: dict[str, float],
+        val_metrics: dict[str, float],
+        per_class_metrics: dict[str, float] | None = None,
+        learning_rate: float | None = None,
+        qualitative_batch: dict[str, torch.Tensor] | None = None,
+        class_labels: dict[int, str] | None = None,
+        qualitative_frequency: int = 1,
+    ) -> None:
+        """Log all training results for one epoch."""
+
+        if not self.is_active:
+            return
+
+        metrics: dict[str, Any] = {
+            f"train/{key}": value
+            for key, value in train_metrics.items()
+        }
+
+        metrics.update(
+            {
+                f"val/{key}": value
+                for key, value in val_metrics.items()
+            }
+        )
+
+        if per_class_metrics:
+            metrics.update(
+                {
+                    f"val/{key}": value
+                    for key, value in per_class_metrics.items()
+                }
+            )
+
+        if learning_rate is not None:
+            metrics["optimizer/lr"] = learning_rate
+
+        metrics["epoch"] = epoch
+
+        self.log_metrics(
+            metrics,
+            step=epoch,
+            commit=True,
+        )
+
+        if (
+            qualitative_batch is not None
+            and epoch % qualitative_frequency == 0
+        ):
+            self.log_qualitative_masks(
+                images=qualitative_batch["image"],
+                labels=qualitative_batch["mask"],
+                predictions=qualitative_batch["prediction"],
+                class_labels=class_labels or {},
+                epoch=epoch,
+            )

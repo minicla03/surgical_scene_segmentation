@@ -37,6 +37,7 @@ class Trainer:
         self.cfg = cfg
         self.device = device
         self.logger = logger
+        self.class_labels = getattr(self.metric_manager, "class_names", {})
 
         train_cfg = cfg.train
         self.max_epochs = int(train_cfg.get("max_epochs", 50))
@@ -74,52 +75,27 @@ class Trainer:
 
         self.output_dir = Path(cfg.get("output_dir", "./outputs"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.best_checkpoint_path = self.output_dir / "best.pt"
+
+        lr = float(self.optimizer.param_groups[0]["lr"])
+        lr_str = f"{lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
+
+        self.best_checkpoint_path = (
+            self.output_dir / f"best_{self.cfg.data.name}_{self.cfg.model.name}_lr_{lr_str}.pt"
+        )
 
     # Forward
     def _forward(
         self,
         images: torch.Tensor,
         masks: torch.Tensor | None = None,
-        training: bool = False,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """
-        Forward pass.
-        Returns:
-            logits/predictions,
-            loss
-        """
-        # Mask2Former
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        
         if getattr(self.model, "is_mask2former", False):
-            if training:
-                outputs = self.model(pixel_values=images, labels=masks)
-                loss = getattr(outputs, "loss", None)
+            return self.model(images, masks)
 
-                if loss is None:
-                    raise RuntimeError("Mask2Former did not return a training loss.")
+        predictions = self.model(images)
 
-                logits = getattr(outputs, "logits", None)
-                #if logits is None:
-                #    raise RuntimeError("Mask2Former did not return logits.")
-
-                # During training, Mask2Former computes the loss internally.
-                return None, loss
-
-            outputs = self.model(pixel_values=images)
-            logits = getattr(outputs, "logits", None)
-
-            if logits is None:
-                raise RuntimeError("Mask2Former did not return logits.")
-
-            return logits, None
-
-        # Standard segmentation model
-        logits = self.model(images)
-        loss = None
-        if masks is not None:
-            loss = self.loss_fn(logits, masks)
-
-        return logits, loss
+        return predictions, None
 
     # Batch preparation
     def _prepare_batch(
@@ -155,135 +131,139 @@ class Trainer:
         enabled = precision == "16-mixed" and self.device.type == "cuda"
         return torch.amp.autocast(device_type="cuda", enabled=enabled)
 
-    # Training
-    def train_epoch(
-        self,
-        epoch: int,
-    ) -> dict[str, float]:
+    def _optimizer_step(self) -> None:
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
 
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            max_norm=1.0,
+        )
+
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+    # Training
+    def train_epoch(self, epoch: int) -> tuple[float, dict[str, float], dict[str, float]]:
+        
         self.model.train()
         self.metric_manager.reset()
 
-        total_loss = 0.0
+        self.optimizer.zero_grad(set_to_none=True)
+
+        running_loss = 0.0
         num_batches = 0
 
-        self.optimizer.zero_grad(set_to_none=True)
-        progress = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]", leave=False)
+        progress = tqdm(
+            self.train_loader,
+            desc=f"Epoch {epoch} [Train]",
+            leave=False,
+        )
 
-        for batch_idx, batch in enumerate(progress):
+        for step, batch in enumerate(progress):
+            
             images, masks = self._prepare_batch(batch)
 
             with self._autocast():
-                logits, loss = self._forward(images, masks, training=True)
-                if loss is None:
-                    raise RuntimeError("Training loss is None.")
-                loss_for_backward = loss / self.accumulation_steps
+                predictions, loss = self._forward(images, masks)
 
-            # ---- Update per‑class metrics for training ----
-            if logits is not None:
-                self.metric_manager.update(
-                    logits.detach(),
-                    masks.detach(),
-                )
+            if loss is None:
+                if self.loss_fn is None:
+                    raise RuntimeError(
+                        "Model returned no loss and no loss function is configured."
+                    )
+
+                loss = self.loss_fn(predictions, masks)
+
+            loss_for_backward = loss / self.accumulation_steps
 
             if self.scaler is not None:
                 self.scaler.scale(loss_for_backward).backward()
             else:
                 loss_for_backward.backward()
 
-            should_update = (batch_idx + 1) % self.accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader)
+            if (step + 1) % self.accumulation_steps == 0 or (step + 1) == len(self.train_loader):
+                self._optimizer_step()
 
-            if should_update:
-                if self.scaler is not None:
-                    self.scaler.unscale_(self.optimizer)
+            self.metric_manager.update(predictions.detach(), masks.detach())
 
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                if self.scaler is not None:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
-
-                self.optimizer.zero_grad(set_to_none=True)
-
-            loss_value = float(loss.detach().item())
-            total_loss += loss_value
+            running_loss += loss.detach().item()
             num_batches += 1
-            progress.set_postfix(loss=f"{loss_value:.4f}")
 
-        # Compute per‑class training metrics and reset for validation
-        train_metrics = self.metric_manager.compute()
-        train_per_class = self.metric_manager.compute_per_class()
-        
-        self.metric_manager.reset()
+            progress.set_postfix(loss=f"{loss.item():.4f}")
 
-        return {
-            "loss": total_loss / max(num_batches, 1), 
-            **train_metrics,
-            **train_per_class
-        }
+        metrics = self.metric_manager.compute()
+        loss_value = running_loss / max(num_batches, 1)
+        per_class = self.metric_manager.compute_per_class()
+
+        return loss_value, metrics, per_class
 
 
     # Validation
+    @torch.no_grad()
     def validate(
-        self,
-        epoch: int,
-    ) -> tuple[dict[str, float], dict[str, float], dict[str, torch.Tensor] | None]:
-
+        self, epoch: int
+    ) -> tuple[float, dict[str, float], dict[str, float], dict[str, torch.Tensor] | None]:
+        
         self.model.eval()
         self.metric_manager.reset()
 
-        total_loss = 0.0
+        running_loss = 0.0
         num_batches = 0
-        total_images = 0
-        total_model_time = 0.0
         qualitative_batch = None
 
-        progress = tqdm(self.val_loader, desc=f"Epoch {epoch} [Val]", leave=False)
+        progress = tqdm(
+            self.val_loader,
+            desc=f"Epoch {epoch} [Val]",
+            leave=False,
+        )
 
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(progress):
-                images, masks = self._prepare_batch(batch)
+        for batch_index, batch in enumerate(progress):
+            images, masks = self._prepare_batch(batch)
 
-                if self.qualitative_enabled and qualitative_batch is None and batch_idx == 0:
-                    max_samples = min(self.qualitative_max_samples, images.shape[0])
-                    qualitative_batch = {
-                        "image": images[:max_samples].detach().cpu(),
-                        "mask": masks[:max_samples].detach().cpu(),
-                    }
+            with self._autocast():
+                predictions, loss = self._forward(images, masks)
 
-                start_time = time.perf_counter()
+            if loss is None:
+                if self.loss_fn is None:
+                    raise RuntimeError("Model returned no loss and no loss function is configured.")
+                loss = self.loss_fn(predictions, masks)
 
-                with self._autocast():
-                    logits, model_loss = self._forward(images, masks, training=False)
+            self.metric_manager.update(predictions.detach(), masks.detach())
 
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize()
+            running_loss += loss.detach().item()
+            num_batches += 1
 
-                elapsed = time.perf_counter() - start_time
-                total_model_time += elapsed
-                total_images += images.shape[0]
+            if (
+                batch_index == 0
+                and self.qualitative_enabled
+                and epoch % self.qualitative_freq  == 0
+            ):
+                n_samples = min(self.qualitative_max_samples, images.shape[0])
+                
+                prediction = predictions[:n_samples]
 
-                # Standard models compute validation loss here.
-                # Mask2Former may already provide it.
-                loss = model_loss
-                if loss is None:
-                    loss = self.loss_fn(logits, masks)
+                if prediction.ndim == 4:
+                    prediction = prediction.argmax(dim=1)
 
-                total_loss += float(loss.detach().item())
-                num_batches += 1
+                qualitative_batch = {
+                    "image": images[:n_samples].detach().cpu(),
+                    "mask": masks[:n_samples].detach().cpu(),
+                    "prediction": prediction.detach().cpu(),
+                }
 
-                self.metric_manager.update(logits, masks)
+            progress.set_postfix(loss=f"{loss.item():.4f}")
 
-        results = self.metric_manager.compute()
-        per_class_results = self.metric_manager.compute_per_class()
+        metrics = self.metric_manager.compute()
+        loss_value = running_loss / max(num_batches, 1)
+        per_class = self.metric_manager.compute_per_class()
 
-        results["loss"] = total_loss / max(num_batches, 1)
-        results["fps"] = total_images / max(total_model_time, 1e-8)
-        results = {key: float(value) for key, value in results.items()}
-
-        return results, per_class_results, qualitative_batch
+        return loss_value, metrics, per_class, qualitative_batch
 
     # Checkpoint
     def _save_checkpoint(
@@ -310,14 +290,14 @@ class Trainer:
 
         if self.logger is not None:
 
+            lr = float(self.optimizer.param_groups[0]["lr"])
+            lr_str = f"{lr:.0e}"
+
             self.logger.log_checkpoint(
                 checkpoint=checkpoint,
                 checkpoint_path=path,
-                name="model",
-                aliases=[
-                    f"epoch-{epoch}",
-                    "latest",
-                ],
+                name=f"model_lr_{lr_str}",
+                aliases=[f"epoch-{epoch}", "latest"],
             )
 
         else:
@@ -336,6 +316,7 @@ class Trainer:
         epoch: int,
         metrics: dict[str, float],
     ) -> bool:
+
         if self.monitor not in metrics:
             raise KeyError(
                 f"Monitor metric '{self.monitor}' not found in validation metrics: "
@@ -362,93 +343,47 @@ class Trainer:
         epoch: int,
         train_metrics: dict[str, float],
         val_metrics: dict[str, float],
-        per_class_results: dict[str, float],
+        per_class: dict[str, float],
         qualitative_batch: dict[str, torch.Tensor] | None,
     ) -> None:
-
 
         if self.logger is None:
             return
 
-        metrics = {}
-        for key, value in train_metrics.items():
-            metrics[f"train/{key}"] = value
-
-        for key, value in val_metrics.items():
-            metrics[f"val/{key}"] = value
-
-        for key, value in per_class_results.items():
-            metrics[f"val/{key}"] = value
-
-        metrics["epoch"] = epoch
-
-        if self.scheduler is not None:
-            try:
-                metrics["learning_rate"] = self.optimizer.param_groups[0]["lr"]
-            except Exception:
-                pass
-
-        self.logger.log_metrics(metrics, step=epoch, commit=True)
-
-        # Per-class metric names
-        num_classes = int(self.cfg.data.num_classes)
-        class_labels = {index: f"class_{index}" for index in range(num_classes)}
-        configured_labels = self.cfg.data.get("classes", self.cfg.data.get("class_labels", None))
-
-        if configured_labels is not None:
-            if isinstance(configured_labels, dict):
-                class_labels = {int(key): str(value) for key, value in configured_labels.items()}
-            elif isinstance(configured_labels, (list, tuple)):
-                class_labels = {index: str(name) for index, name in enumerate(configured_labels)}
-
-        # Qualitative logging
-        if not self.qualitative_enabled or qualitative_batch is None or epoch % self.qualitative_freq != 0:
-            return
-
-        images = qualitative_batch["image"]
-        masks = qualitative_batch["mask"]
-
-        with torch.no_grad():
-            with self._autocast():
-                logits, _ = self._forward(
-                    images.to(self.device),
-                    masks.to(self.device),
-                    training=False,
-                )
-
-        predictions = torch.argmax(logits, dim=1).detach().cpu()
-        images = images.detach().cpu()
-        masks = masks.detach().cpu()
-
-        self.logger.log_qualitative_masks(
-            images=images,
-            labels=masks,
-            predictions=predictions,
-            class_labels=class_labels,
+        self.logger.log_epoch(
             epoch=epoch,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            per_class_metrics=per_class,
+            learning_rate=self.optimizer.param_groups[0]["lr"],
+            qualitative_batch=qualitative_batch,
+            class_labels=self.class_labels,
+            qualitative_frequency=self.qualitative_freq,
         )
 
     # Training loop
     def fit(self) -> dict[str, Any]:
+        
         history: list[dict[str, Any]] = []
 
         for epoch in range(1, self.max_epochs + 1):
-            epoch_start = time.perf_counter()
-            train_metrics = self.train_epoch(epoch)
 
-            # Scheduler
-            if self.scheduler is not None:
-                self.scheduler.step()
+            epoch_start = time.perf_counter()
+
+            # Train
+            train_loss, train_metrics, train_per_class = self.train_epoch(epoch)
+            train_metrics["loss"] = train_loss
 
             # Validation
             if epoch % self.eval_freq == 0:
-                val_metrics, per_class_results, qualitative_batch = self.validate(epoch)
+                val_loss, val_metrics, per_class_results, qualitative_batch = self.validate(epoch)
+                val_metrics["loss"] = val_loss
 
                 self._log_epoch(
                     epoch=epoch,
                     train_metrics=train_metrics,
                     val_metrics=val_metrics,
-                    per_class_results=per_class_results,
+                    per_class=per_class_results,
                     qualitative_batch=qualitative_batch,
                 )
 
@@ -491,6 +426,9 @@ class Trainer:
                 }
                 history.append(epoch_results)
 
+            if self.scheduler is not None:
+                self.scheduler.step()
+
         return {
             "history": history,
             "best_epoch": self.best_epoch,
@@ -498,16 +436,3 @@ class Trainer:
             "best_metrics": self.best_metrics,
             "best_checkpoint": str(self.best_checkpoint_path),
         }
-
-    # Utilities
-    @staticmethod
-    def _safe_mean(values: list[float]) -> float:
-        if not values:
-            return 0.0
-
-        finite_values = [value for value in values if np.isfinite(value)]
-
-        if not finite_values:
-            return 0.0
-
-        return float(np.mean(finite_values))
