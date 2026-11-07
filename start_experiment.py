@@ -119,39 +119,43 @@ def main(cfg: DictConfig):
         log_step(6, "Creating DataLoaders...")
         train_loader, val_loader, test_loader = None, None, None
 
+        num_workers = int(cfg.train.get("num_workers", 0))
+        pin_memory = bool(cfg.train.get("pin_memory", True))
+        persistent_workers = bool(cfg.train.get("persistent_workers", num_workers > 0)) if num_workers > 0 else False
+        multiprocessing_context = cfg.train.get("multiprocessing_context", "spawn") if num_workers > 0 else None
+
+        dataloader_kwargs = {
+            "batch_size": cfg.train.batch_size,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "worker_init_fn": seed_worker,
+            "generator": generator,
+        }
+        if num_workers > 0:
+            dataloader_kwargs["persistent_workers"] = persistent_workers
+            dataloader_kwargs["multiprocessing_context"] = multiprocessing_context
+
         if train_dataset is not None:
             train_loader = DataLoader(
                 train_dataset,
-                batch_size=cfg.train.batch_size,
                 shuffle=True,
-                num_workers=cfg.train.num_workers,
-                pin_memory=cfg.train.pin_memory,
-                worker_init_fn=seed_worker,
-                generator=generator,
+                **dataloader_kwargs,
             )
             print(f"           Train batches: {len(train_loader)}", flush=True)
 
         if val_dataset is not None:
             val_loader = DataLoader(
                 val_dataset,
-                batch_size=cfg.train.batch_size,
                 shuffle=False,
-                num_workers=cfg.train.num_workers,
-                pin_memory=cfg.train.pin_memory,
-                worker_init_fn=seed_worker,
-                generator=generator,
+                **dataloader_kwargs,
             )
             print(f"           Val batches  : {len(val_loader)}", flush=True)
 
         if test_dataset is not None:
             test_loader = DataLoader(
                 test_dataset,
-                batch_size=cfg.train.batch_size,
                 shuffle=False,
-                num_workers=cfg.train.num_workers,
-                pin_memory=cfg.train.pin_memory,
-                worker_init_fn=seed_worker,
-                generator=generator,
+                **dataloader_kwargs,
             )
             print(f"           Test batches : {len(test_loader)}", flush=True)
         else:

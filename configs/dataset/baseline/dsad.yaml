@@ -18,7 +18,11 @@ data:
     root: ${paths.data}/DSAD
     variant: multi_organ
 
-  num_classes: 2
+  num_classes: ${data.class_config.${data.dataset.variant}}
+
+  class_config:
+    single_organ: 2
+    multi_organ: 8
 
   split:
     strategy: official
@@ -39,7 +43,7 @@ preprocessing:
     normalize: true
 
   mask:
-    channel_first: false
+    channel_first: true
     dtype: long
 
 

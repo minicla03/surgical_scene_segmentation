@@ -9,12 +9,12 @@ implementation:
   class: Mask2FormerForUniversalSegmentation
   repository: facebook/mask2former
 
+pretrained:
+  enabled: false
+  checkpoint: facebook/mask2former-swin-base-ade-semantic
+
 architecture:
   _target_: src.models.mask2former_wrapper.Mask2FormerWrapper
-
-  checkpoint: facebook/mask2former-swin-base-ade-semantic
-  num_labels: ${data.num_classes}
-
-pretrained:
-  enabled: true
-  checkpoint: facebook/mask2former-swin-base-ade-semantic
+  checkpoint: ${model.pretrained.checkpoint}
+  pretrained: ${model.pretrained.enabled}
+  num_labels: ${data.num_classes} 

@@ -36,7 +36,7 @@ architecture:
     - [2, 2]
     - [2, 2]
     - [2, 2]
-    - [2, 2]
+    - [1, 1]
 
   n_conv_per_stage:
     - 2

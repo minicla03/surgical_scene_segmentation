@@ -74,6 +74,8 @@ train:
 
   num_workers: 4
   pin_memory: true
+  persistent_workers: true
+  multiprocessing_context: "spawn"
 
   precision: "16-mixed"
 
