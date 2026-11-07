@@ -91,9 +91,15 @@ class DSADDataset(BaseSegmentationDataset):
         value = cls._unwrap_value(value)
 
         if isinstance(value, bytes):
-            return np.array(Image.open(BytesIO(value)).convert("RGB"))
+            image = Image.open(BytesIO(value))
+            if "transparency" in image.info:
+                image = image.convert("RGBA")
+            return np.array(image.convert("RGB"))
         if isinstance(value, (str, Path)):
-            return np.array(Image.open(value).convert("RGB"))
+            image = Image.open(value)
+            if "transparency" in image.info:
+                image = image.convert("RGBA")
+            return np.array(image.convert("RGB"))
         if isinstance(value, Image.Image):
             return np.array(value.convert("RGB"))
 
@@ -109,9 +115,15 @@ class DSADDataset(BaseSegmentationDataset):
         value = cls._unwrap_value(value)
 
         if isinstance(value, bytes):
-            return np.array(Image.open(BytesIO(value)).convert("L"))
+            image = Image.open(BytesIO(value))
+            if "transparency" in image.info:
+                image = image.convert("RGBA")
+            return np.array(image.convert("L"))
         if isinstance(value, (str, Path)):
-            return np.array(Image.open(value).convert("L"))
+            image = Image.open(value)
+            if "transparency" in image.info:
+                image = image.convert("RGBA")
+            return np.array(image.convert("L"))
         if isinstance(value, Image.Image):
             return np.array(value.convert("L"))
 
