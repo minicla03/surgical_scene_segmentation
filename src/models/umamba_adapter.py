@@ -10,14 +10,13 @@ class UMambaWrapper(nn.Module):
     """
     Adapter between the thesis segmentation framework and U-Mamba.
 
+    All architecture parameters are configurable through Hydra.
+
     Input:
         [B, C, H, W]
 
     Output:
         [B, num_classes, H, W]
-
-    The wrapper deliberately exposes a standard PyTorch interface so that
-    the existing Trainer, losses, metrics and W&B logging can be reused.
     """
 
     def __init__(
@@ -26,68 +25,45 @@ class UMambaWrapper(nn.Module):
         num_classes: int,
         n_stages: int = 6,
         features_per_stage: list[int] | None = None,
-        kernel_sizes: list[tuple[int, int]] | None = None,
-        strides: list[tuple[int, int]] | None = None,
+        kernel_sizes: list[list[int]] | None = None,
+        strides: list[list[int]] | None = None,
         n_conv_per_stage: list[int] | None = None,
         n_conv_per_stage_decoder: list[int] | None = None,
         deep_supervision: bool = False,
     ):
         super().__init__()
 
-        # ------------------------------------------------------------
-        # Default architecture
-        # ------------------------------------------------------------
 
-        if features_per_stage is None:
-            features_per_stage = [
-                32,
-                64,
-                128,
-                256,
-                320,
-                320,
-            ]
+        n_stages = int(n_stages)
+        input_channels = int(input_channels)
+        num_classes = int(num_classes)
 
-        if kernel_sizes is None:
-            kernel_sizes = [
-                (3, 3)
-                for _ in range(n_stages)
-            ]
+        features_per_stage = [
+            int(features)
+            for features in features_per_stage
+        ]
 
-        if strides is None:
-            strides = [
-                (1, 1),
-                (2, 2),
-                (2, 2),
-                (2, 2),
-                (2, 2),
-                (2, 2),
-            ]
+        kernel_sizes = [
+            tuple(int(value) for value in kernel_size)
+            for kernel_size in kernel_sizes
+        ]
 
-        if n_conv_per_stage is None:
-            n_conv_per_stage = [
-                2
-                for _ in range(n_stages)
-            ]
+        strides = [
+            tuple(int(value) for value in stride)
+            for stride in strides
+        ]
 
-        if n_conv_per_stage_decoder is None:
-            n_conv_per_stage_decoder = [
-                2
-                for _ in range(n_stages - 1)
-            ]
+        n_conv_per_stage = [
+            int(value)
+            for value in n_conv_per_stage
+        ]
 
-        # ------------------------------------------------------------
-        # Defensive copies
-        #
-        # U-Mamba modifies some of these lists internally.
-        # Therefore they must be mutable lists, not tuples.
-        # ------------------------------------------------------------
+        n_conv_per_stage_decoder = [
+            int(value)
+            for value in n_conv_per_stage_decoder
+        ]
 
-        features_per_stage = list(features_per_stage)
-        kernel_sizes = list(kernel_sizes)
-        strides = list(strides)
-        n_conv_per_stage = list(n_conv_per_stage)
-        n_conv_per_stage_decoder = list(n_conv_per_stage_decoder)
+        deep_supervision = bool(deep_supervision)
 
         # ------------------------------------------------------------
         # Sanity checks
@@ -96,25 +72,29 @@ class UMambaWrapper(nn.Module):
         if len(features_per_stage) != n_stages:
             raise ValueError(
                 "features_per_stage must contain exactly "
-                f"{n_stages} values, got {len(features_per_stage)}"
+                f"{n_stages} values, got "
+                f"{len(features_per_stage)}"
             )
 
         if len(kernel_sizes) != n_stages:
             raise ValueError(
                 "kernel_sizes must contain exactly "
-                f"{n_stages} values, got {len(kernel_sizes)}"
+                f"{n_stages} values, got "
+                f"{len(kernel_sizes)}"
             )
 
         if len(strides) != n_stages:
             raise ValueError(
                 "strides must contain exactly "
-                f"{n_stages} values, got {len(strides)}"
+                f"{n_stages} values, got "
+                f"{len(strides)}"
             )
 
         if len(n_conv_per_stage) != n_stages:
             raise ValueError(
                 "n_conv_per_stage must contain exactly "
-                f"{n_stages} values, got {len(n_conv_per_stage)}"
+                f"{n_stages} values, got "
+                f"{len(n_conv_per_stage)}"
             )
 
         if len(n_conv_per_stage_decoder) != n_stages - 1:
@@ -125,7 +105,7 @@ class UMambaWrapper(nn.Module):
             )
 
         # ------------------------------------------------------------
-        # U-Mamba
+        # Build U-Mamba
         # ------------------------------------------------------------
 
         self.model = UMambaBot(
@@ -158,13 +138,13 @@ class UMambaWrapper(nn.Module):
         """
         Forward pass.
 
-        Returns a single segmentation tensor so that the existing Trainer
-        can directly compute the configured loss.
+        If deep supervision is enabled and U-Mamba returns multiple
+        outputs, only the highest-resolution output is returned so
+        that the existing Trainer receives a single segmentation tensor.
         """
 
         output = self.model(x)
 
-        # Safety handling in case deep supervision is accidentally enabled.
         if isinstance(output, (list, tuple)):
             output = output[0]
 
