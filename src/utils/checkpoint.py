@@ -33,6 +33,24 @@ def sanitize_artifact_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]", "_", name)
 
 
+def resolve_checkpoint_dir(cfg: Any) -> Path:
+    """Resolve the directory used for saving and resuming checkpoints."""
+    output_dir = cfg.get("output_dir") if hasattr(cfg, "get") else getattr(cfg, "output_dir", None)
+    if output_dir:
+        return Path(str(output_dir))
+
+    paths_cfg = (cfg.get("paths") or {}) if hasattr(cfg, "get") else getattr(cfg, "paths", None)
+    ckpt_dir = (
+        paths_cfg.get("checkpoint")
+        if hasattr(paths_cfg, "get")
+        else getattr(paths_cfg, "checkpoint", None)
+    )
+    if ckpt_dir:
+        return Path(str(ckpt_dir))
+
+    return Path("./outputs")
+
+
 def build_checkpoint_paths(
     output_dir: str | Path,
     dataset_name: str,
@@ -297,7 +315,7 @@ def resolve_resume_context(cfg: Any) -> ResumeContext:
     if not any([enabled, auto, raw_ckpt_path, wandb_run_id, wandb_artifact]):
         return ResumeContext(resume_wandb=resume_wandb, source="none")
 
-    output_dir = Path(cfg.get("output_dir", "./outputs"))
+    output_dir = resolve_checkpoint_dir(cfg)
     expected_paths = build_checkpoint_paths(
         output_dir=output_dir,
         dataset_name=str(cfg.data.name),

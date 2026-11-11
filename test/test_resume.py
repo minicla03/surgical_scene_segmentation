@@ -20,6 +20,7 @@ from src.utils.checkpoint import (
     build_checkpoint_paths,
     build_epoch_checkpoint_path,
     load_checkpoint_file,
+    resolve_checkpoint_dir,
     resolve_resume_context,
 )
 from src.utils.repro import seed_worker, set_seed
@@ -497,4 +498,36 @@ class TestCheckpointAndResume:
         assert art.name == "sarrarp50_U-Net_lr_1e-3"
         assert art.metadata == {"epoch": 18, "kind": "best"}
         assert aliases == ["epoch-18", "best"]
+
+    def test_resolve_checkpoint_dir_and_hydra_default(self, tmp_path: Path):
+        from hydra import compose, initialize_config_dir
+
+        # Explicit output_dir takes precedence over paths.checkpoint
+        cfg_explicit = OmegaConf.create({
+            "output_dir": str(tmp_path / "custom"),
+            "paths": {"checkpoint": "/work/tesi_cmininno/checkpoint/sarrarp50/U-Net"},
+        })
+        assert resolve_checkpoint_dir(cfg_explicit) == tmp_path / "custom"
+
+        # Falls back to paths.checkpoint when output_dir is omitted
+        cfg_paths_only = OmegaConf.create({
+            "paths": {"checkpoint": "/work/tesi_cmininno/checkpoint/sarrarp50/U-Net"},
+        })
+        assert resolve_checkpoint_dir(cfg_paths_only) == Path("/work/tesi_cmininno/checkpoint/sarrarp50/U-Net")
+
+        # Falls back to ./outputs when neither is set
+        assert resolve_checkpoint_dir(OmegaConf.create({})) == Path("./outputs")
+
+        # Hydra project config composes output_dir to /work/tesi_cmininno/checkpoint/<name>/<model.name>
+        config_dir = str(Path(__file__).resolve().parents[1] / "configs")
+        with initialize_config_dir(version_base=None, config_dir=config_dir):
+            hydra_cfg = compose(
+                config_name="config",
+                overrides=[
+                    "dataset=baseline/sarrarp50",
+                    "training=baseline/sarrarp50",
+                    "model=baseline/unet",
+                ],
+            )
+        assert resolve_checkpoint_dir(hydra_cfg) == Path("/work/tesi_cmininno/checkpoint/sarrarp50/U-Net")
 

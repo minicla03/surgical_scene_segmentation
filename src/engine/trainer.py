@@ -15,6 +15,7 @@ from src.utils.checkpoint import (
     capture_rng_state,
     format_lr_str,
     load_checkpoint_file,
+    resolve_checkpoint_dir,
     restore_rng_state,
     sanitize_artifact_name,
 )
@@ -96,7 +97,7 @@ class Trainer:
         self.upload_best_to_wandb = bool(ckpt_cfg.get("upload_best_to_wandb", True))
         self.upload_last_to_wandb = bool(ckpt_cfg.get("upload_last_to_wandb", False))
 
-        self.output_dir = Path(cfg.get("output_dir", "./outputs"))
+        self.output_dir = resolve_checkpoint_dir(cfg)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.initial_lr = float(self.optimizer.param_groups[0]["lr"])

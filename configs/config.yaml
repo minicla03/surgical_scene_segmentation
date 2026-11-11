@@ -13,6 +13,8 @@ paths:
   output: ${hydra:runtime.cwd}/experiments
   checkpoint: /work/tesi_cmininno/checkpoint/${name}/${model.name}
 
+output_dir: ${paths.checkpoint}
+
 device: cuda
 
 logging:
