@@ -8,6 +8,8 @@ import wandb
 
 from pathlib import Path
 
+from src.utils.checkpoint import atomic_torch_save
+
 
 class WandbLogger:
     def __init__(
@@ -19,24 +21,41 @@ class WandbLogger:
         config: dict[str, Any] | None = None,
         tags: list[str] | None = None,
         mode: str = "online",
+        run_id: str | None = None,
+        resume: str | None = None,
     ) -> None:
         self.is_active = False
         self.enabled = enabled
+        self.run_id: str | None = None
+        self.resumed: bool = False
 
         if not self.enabled:
             return
 
         if wandb.run is None:
-            wandb.init(
-                project=project,
-                entity=entity,
-                name=name,
-                config=config,
-                tags=tags,
-                mode=mode,
-            )
+            init_kwargs: dict[str, Any] = {
+                "project": project,
+                "entity": entity,
+                "name": name,
+                "tags": tags,
+                "mode": mode,
+            }
+            if run_id is not None:
+                init_kwargs["id"] = run_id
+                init_kwargs["resume"] = resume or "must"
+                wandb.init(**init_kwargs)
+                if config is not None and wandb.run is not None:
+                    wandb.config.update(config, allow_val_change=True)
+            else:
+                init_kwargs["config"] = config
+                if resume is not None:
+                    init_kwargs["resume"] = resume
+                wandb.init(**init_kwargs)
 
         self.is_active = wandb.run is not None
+        if wandb.run is not None:
+            self.run_id = wandb.run.id
+            self.resumed = bool(getattr(wandb.run, "resumed", False))
 
     # Generic metrics
     def log_metrics(
@@ -244,23 +263,19 @@ class WandbLogger:
         checkpoint_path: str | Path,
         name: str = "model",
         aliases: list[str] | None = None,
+        upload_to_wandb: bool = True,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
 
-        checkpoint_path = Path(checkpoint_path)
-        checkpoint_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        checkpoint_path = atomic_torch_save(checkpoint, Path(checkpoint_path))
 
-        # save locally.
-        torch.save(checkpoint, checkpoint_path)
-
-        if not self.is_active:
+        if not self.is_active or not upload_to_wandb:
             return
 
         artifact = wandb.Artifact(
             name=name,
             type="model",
+            metadata=metadata,
         )
         artifact.add_file(str(checkpoint_path))
 
@@ -291,7 +306,8 @@ class WandbLogger:
         if model_name is not None:
             metrics["model/name"] = model_name
 
-        wandb.log(metrics)
+        if not self.resumed:
+            wandb.log(metrics)
 
         print("\n" + "=" * 60)
         print("MODEL INFORMATION")

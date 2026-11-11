@@ -24,3 +24,18 @@ logging:
 
   experiment_name: ${name}_${model.name}
   tags: []
+
+checkpoint:
+  save_last: true
+  save_every_n_epochs: null
+  upload_best_to_wandb: true
+  upload_last_to_wandb: false
+
+resume:
+  enabled: false
+  auto: false
+  checkpoint_path: null
+  wandb_run_id: null
+  wandb_artifact: null
+  epoch: null
+  resume_wandb: true

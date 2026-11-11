@@ -8,6 +8,17 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from src.utils.checkpoint import (
+    atomic_torch_save,
+    build_checkpoint_paths,
+    build_epoch_checkpoint_path,
+    capture_rng_state,
+    format_lr_str,
+    load_checkpoint_file,
+    restore_rng_state,
+    sanitize_artifact_name,
+)
+
 
 class Trainer:
 
@@ -24,6 +35,7 @@ class Trainer:
         cfg: Any,
         device: torch.device,
         logger: Any | None = None,
+        dataloader_generator: torch.Generator | None = None,
     ) -> None:
 
         self.model = model.to(device)
@@ -37,6 +49,7 @@ class Trainer:
         self.cfg = cfg
         self.device = device
         self.logger = logger
+        self.dataloader_generator = dataloader_generator
         self.class_labels = getattr(self.metric_manager, "class_names", {})
 
         train_cfg = cfg.train
@@ -72,15 +85,33 @@ class Trainer:
         self.best_epoch = 0
         self.best_metrics: dict[str, float] = {}
         self.epochs_without_improvement = 0
+        self.start_epoch = 1
+        self.history: list[dict[str, Any]] = []
+        self.resumed_from: Path | None = None
+
+        ckpt_cfg = cfg.get("checkpoint") or train_cfg.get("checkpoint") or {}
+        self.save_last = bool(ckpt_cfg.get("save_last", True))
+        save_every = ckpt_cfg.get("save_every_n_epochs", None)
+        self.save_every_n_epochs = int(save_every) if save_every is not None else None
+        self.upload_best_to_wandb = bool(ckpt_cfg.get("upload_best_to_wandb", True))
+        self.upload_last_to_wandb = bool(ckpt_cfg.get("upload_last_to_wandb", False))
 
         self.output_dir = Path(cfg.get("output_dir", "./outputs"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        lr = float(self.optimizer.param_groups[0]["lr"])
-        lr_str = f"{lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
+        self.initial_lr = float(self.optimizer.param_groups[0]["lr"])
+        self.initial_lr_str = format_lr_str(self.initial_lr)
 
-        self.best_checkpoint_path = (
-            self.output_dir / f"best_{self.cfg.data.name}_{self.cfg.model.name}_lr_{lr_str}.pt"
+        ckpt_paths = build_checkpoint_paths(
+            output_dir=self.output_dir,
+            dataset_name=str(self.cfg.data.name),
+            model_name=str(self.cfg.model.name),
+            lr=self.initial_lr,
+        )
+        self.best_checkpoint_path = ckpt_paths["best"]
+        self.last_checkpoint_path = ckpt_paths["last"]
+        self.artifact_base_name = sanitize_artifact_name(
+            f"{self.cfg.data.name}_{self.cfg.model.name}_lr_{self.initial_lr_str}"
         )
 
     # Forward
@@ -271,39 +302,182 @@ class Trainer:
         path: Path,
         epoch: int,
         metrics: dict[str, float],
+        kind: str = "best",
+        scheduler_stepped: bool = False,
+        upload_to_wandb: bool = True,
+        aliases: list[str] | None = None,
     ) -> None:
-        
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "scheduler_stepped": scheduler_stepped,
             "best_score": self.best_score,
             "best_epoch": self.best_epoch,
             "best_metrics": self.best_metrics,
+            "epochs_without_improvement": self.epochs_without_improvement,
+            "history": self.history,
             "metrics": metrics,
             "config": self.cfg,
+            "rng_state": capture_rng_state(self.dataloader_generator),
+            "wandb_run_id": (
+                self.logger.run_id
+                if self.logger is not None and getattr(self.logger, "is_active", False)
+                else None
+            ),
         }
 
         if self.scaler is not None:
             checkpoint["scaler_state_dict"] = self.scaler.state_dict()
 
         if self.logger is not None:
-
-            lr = float(self.optimizer.param_groups[0]["lr"])
-            lr_str = f"{lr:.0e}"
-
+            best_score_meta = (
+                float(self.best_score) if np.isfinite(self.best_score) else None
+            )
+            metadata = {
+                "epoch": int(epoch),
+                "kind": kind,
+                "dataset": str(self.cfg.data.name),
+                "model": str(self.cfg.model.name),
+                "lr": self.initial_lr_str,
+                "best_score": best_score_meta,
+            }
             self.logger.log_checkpoint(
                 checkpoint=checkpoint,
                 checkpoint_path=path,
-                name=f"model_lr_{lr_str}",
-                aliases=[f"epoch-{epoch}", "latest"],
+                name=self.artifact_base_name,
+                aliases=aliases or [f"epoch-{epoch}", kind, "latest"],
+                upload_to_wandb=upload_to_wandb,
+                metadata=metadata,
+            )
+        else:
+            atomic_torch_save(checkpoint, path)
+
+    def _save_end_of_epoch_checkpoints(
+        self,
+        epoch: int,
+        metrics: dict[str, float],
+    ) -> None:
+        if self.save_last:
+            self._save_checkpoint(
+                path=self.last_checkpoint_path,
+                epoch=epoch,
+                metrics=metrics,
+                kind="last",
+                scheduler_stepped=True,
+                upload_to_wandb=self.upload_last_to_wandb,
+                aliases=[f"epoch-{epoch}", "last", "latest"],
             )
 
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(checkpoint, path)
+        if (
+            self.save_every_n_epochs is not None
+            and self.save_every_n_epochs > 0
+            and epoch % self.save_every_n_epochs == 0
+        ):
+            epoch_path = build_epoch_checkpoint_path(
+                output_dir=self.output_dir,
+                dataset_name=str(self.cfg.data.name),
+                model_name=str(self.cfg.model.name),
+                lr=self.initial_lr,
+                epoch=epoch,
+            )
+            self._save_checkpoint(
+                path=epoch_path,
+                epoch=epoch,
+                metrics=metrics,
+                kind="periodic",
+                scheduler_stepped=True,
+                upload_to_wandb=self.upload_last_to_wandb,
+                aliases=[f"epoch-{epoch}", "periodic"],
+            )
 
+    def _align_resumed_scheduler(
+        self,
+        checkpoint: dict[str, Any],
+        resumed_epoch: int,
+    ) -> None:
+        scheduler_stepped = checkpoint.get("scheduler_stepped")
+        is_plateau = isinstance(
+            self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+        )
+
+        if is_plateau:
+            if scheduler_stepped is False or scheduler_stepped is None:
+                metrics = checkpoint.get("metrics") or {}
+                if self.monitor in metrics:
+                    self.scheduler.step(metrics[self.monitor])
+            return
+
+        if scheduler_stepped is None:
+            # Legacy checkpoints saved inside _update_best were captured before scheduler.step().
+            last_sched_epoch = int(getattr(self.scheduler, "last_epoch", resumed_epoch))
+            if last_sched_epoch < resumed_epoch:
+                for _ in range(resumed_epoch - last_sched_epoch):
+                    self.scheduler.step()
+        elif not scheduler_stepped:
+            self.scheduler.step()
+
+    def load_resume_checkpoint(
+        self,
+        checkpoint_path: str | Path,
+        preloaded_checkpoint: dict[str, Any] | None = None,
+    ) -> int:
+        """Restore full training state from a completed epoch checkpoint."""
+        ckpt_path = Path(checkpoint_path)
+        checkpoint = (
+            preloaded_checkpoint
+            if preloaded_checkpoint is not None
+            else load_checkpoint_file(ckpt_path)
+        )
+
+        if "model_state_dict" not in checkpoint or "epoch" not in checkpoint:
+            raise KeyError(
+                f"Checkpoint at '{ckpt_path}' is missing 'model_state_dict' or 'epoch'."
+            )
+
+        resumed_epoch = int(checkpoint["epoch"])
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        if checkpoint.get("optimizer_state_dict") is not None:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        if self.scaler is not None and checkpoint.get("scaler_state_dict") is not None:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+        if self.scheduler is not None and checkpoint.get("scheduler_state_dict") is not None:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            self._align_resumed_scheduler(checkpoint, resumed_epoch)
+
+        self.best_score = float(checkpoint.get("best_score", self.best_score))
+        self.best_epoch = int(checkpoint.get("best_epoch", 0))
+        self.best_metrics = dict(checkpoint.get("best_metrics", {}))
+        self.epochs_without_improvement = int(
+            checkpoint.get("epochs_without_improvement", 0)
+        )
+        self.history = list(checkpoint.get("history", []))
+        self.start_epoch = resumed_epoch + 1
+        self.resumed_from = ckpt_path
+
+        if (
+            self.best_epoch > 0
+            and resumed_epoch == self.best_epoch
+            and not self.best_checkpoint_path.exists()
+        ):
+            atomic_torch_save(checkpoint, self.best_checkpoint_path)
+
+        restore_rng_state(checkpoint.get("rng_state"), self.dataloader_generator)
+
+        current_lr = float(self.optimizer.param_groups[0]["lr"])
+        print(
+            f"[Resume] Loaded '{ckpt_path}' (completed epoch={resumed_epoch}, "
+            f"next_epoch={self.start_epoch}, best_epoch={self.best_epoch}, "
+            f"best_score={self.best_score:.4f}, "
+            f"epochs_without_improvement={self.epochs_without_improvement}, "
+            f"lr={current_lr:.6g})",
+            flush=True,
+        )
+        return self.start_epoch
 
     # Early stopping
     def _is_improvement(self, score: float) -> bool:
@@ -331,9 +505,21 @@ class Trainer:
         self.best_score = score
         self.best_epoch = epoch
         self.best_metrics = dict(metrics)
-
-        self._save_checkpoint(self.best_checkpoint_path, epoch, metrics)
         self.epochs_without_improvement = 0
+
+        best_aliases = [f"epoch-{epoch}", "best"]
+        if not self.upload_last_to_wandb:
+            best_aliases.append("latest")
+
+        self._save_checkpoint(
+            path=self.best_checkpoint_path,
+            epoch=epoch,
+            metrics=metrics,
+            kind="best",
+            scheduler_stepped=False,
+            upload_to_wandb=self.upload_best_to_wandb,
+            aliases=best_aliases,
+        )
 
         return True
 
@@ -368,80 +554,103 @@ class Trainer:
 
     # Training loop
     def fit(self) -> dict[str, Any]:
-        
-        history: list[dict[str, Any]] = []
+        if self.start_epoch > self.max_epochs:
+            print(
+                f"[Resume] Checkpoint already reached epoch {self.start_epoch - 1} "
+                f"(>= max_epochs={self.max_epochs}). Skipping training loop.",
+                flush=True,
+            )
+        else:
+            for epoch in range(self.start_epoch, self.max_epochs + 1):
 
-        for epoch in range(1, self.max_epochs + 1):
+                epoch_start = time.perf_counter()
+                should_stop = False
 
-            epoch_start = time.perf_counter()
+                # Train
+                train_loss, train_metrics, train_per_class = self.train_epoch(epoch)
+                train_metrics["loss"] = train_loss
+                last_epoch_metrics = train_metrics
 
-            # Train
-            train_loss, train_metrics, train_per_class = self.train_epoch(epoch)
-            train_metrics["loss"] = train_loss
+                # Validation
+                if epoch % self.eval_freq == 0:
+                    val_loss, val_metrics, per_class_results, qualitative_batch = self.validate(epoch)
+                    val_metrics["loss"] = val_loss
+                    last_epoch_metrics = val_metrics
 
-            # Validation
-            if epoch % self.eval_freq == 0:
-                val_loss, val_metrics, per_class_results, qualitative_batch = self.validate(epoch)
-                val_metrics["loss"] = val_loss
+                    self._log_epoch(
+                        epoch=epoch,
+                        train_metrics=train_metrics,
+                        val_metrics=val_metrics,
+                        val_per_class=per_class_results,
+                        train_per_class=train_per_class,
+                        qualitative_batch=qualitative_batch,
+                    )
 
-                self._log_epoch(
+                    improved = self._update_best(epoch, val_metrics)
+
+                    if not improved:
+                        self.epochs_without_improvement += 1
+
+                    epoch_time = time.perf_counter() - epoch_start
+                    epoch_results = {
+                        "epoch": epoch,
+                        "train": train_metrics,
+                        "val": val_metrics,
+                        "train_per_class": train_per_class,
+                        "per_class": per_class_results,
+                        "val_per_class": per_class_results,
+                        "epoch_time": epoch_time,
+                    }
+                    self.history.append(epoch_results)
+
+                    print(
+                        f"[Epoch {epoch:03d}] "
+                        f"train_loss={train_metrics.get('loss', float('nan')):.4f} "
+                        f"val_loss={val_metrics.get('loss', float('nan')):.4f} "
+                        f"{self.monitor}={val_metrics.get(self.monitor, float('nan')):.4f}"
+                    )
+
+                    if improved:
+                        print(f"  -> New best checkpoint ({self.monitor}={self.best_score:.4f})")
+
+                    # Early stopping
+                    if self.early_stopping_enabled and self.epochs_without_improvement >= self.patience:
+                        print("Early stopping triggered.")
+                        should_stop = True
+
+                else:
+                    epoch_time = time.perf_counter() - epoch_start
+                    epoch_results = {
+                        "epoch": epoch,
+                        "train": train_metrics,
+                        "train_per_class": train_per_class,
+                        "epoch_time": epoch_time,
+                    }
+                    self.history.append(epoch_results)
+
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
+                self._save_end_of_epoch_checkpoints(
                     epoch=epoch,
-                    train_metrics=train_metrics,
-                    val_metrics=val_metrics,
-                    val_per_class=per_class_results,
-                    train_per_class=train_per_class,
-                    qualitative_batch=qualitative_batch,
+                    metrics=last_epoch_metrics,
                 )
 
-                improved = self._update_best(epoch, val_metrics)
-
-                if not improved:
-                    self.epochs_without_improvement += 1
-
-                epoch_time = time.perf_counter() - epoch_start
-                epoch_results = {
-                    "epoch": epoch,
-                    "train": train_metrics,
-                    "val": val_metrics,
-                    "train_per_class": train_per_class,
-                    "per_class": per_class_results,
-                    "val_per_class": per_class_results,
-                    "epoch_time": epoch_time,
-                }
-                history.append(epoch_results)
-
-                print(
-                    f"[Epoch {epoch:03d}] "
-                    f"train_loss={train_metrics.get('loss', float('nan')):.4f} "
-                    f"val_loss={val_metrics.get('loss', float('nan')):.4f} "
-                    f"{self.monitor}={val_metrics.get(self.monitor, float('nan')):.4f}"
-                )
-
-                if improved:
-                    print(f"  -> New best checkpoint ({self.monitor}={self.best_score:.4f})")
-
-                # Early stopping
-                if self.early_stopping_enabled and self.epochs_without_improvement >= self.patience:
-                    print("Early stopping triggered.")
+                if should_stop:
                     break
 
-            else:
-                epoch_time = time.perf_counter() - epoch_start
-                epoch_results = {
-                    "epoch": epoch,
-                    "train": train_metrics,
-                    "train_per_class": train_per_class,
-                    "epoch_time": epoch_time,
-                }
-                history.append(epoch_results)
-
-            if self.scheduler is not None:
-                self.scheduler.step()
+        best_ckpt_path = self.best_checkpoint_path
+        if not best_ckpt_path.exists():
+            if self.last_checkpoint_path.exists():
+                best_ckpt_path = self.last_checkpoint_path
+            elif self.resumed_from is not None and self.resumed_from.exists():
+                best_ckpt_path = self.resumed_from
 
         return {
-            "history": history,
+            "history": self.history,
             "best_epoch": self.best_epoch,
             "best_score": self.best_score,
             "best_metrics": self.best_metrics,
-            "best_checkpoint": str(self.best_checkpoint_path),
+            "best_checkpoint": str(best_ckpt_path),
+            "last_checkpoint": str(self.last_checkpoint_path),
         }

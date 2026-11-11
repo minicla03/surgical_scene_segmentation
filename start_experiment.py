@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import hydra
 import torch
@@ -13,6 +14,7 @@ from src.datasets.transformation.transform_dataset import TransformDataset
 from src.engine.tester import Tester
 from src.engine.trainer import Trainer
 from src.metrics.metric_manager import MetricManager
+from src.utils.checkpoint import load_checkpoint_file, resolve_resume_context
 from src.utils.repro import seed_worker, set_seed
 from src.utils.wandb_logging import WandbLogger
 
@@ -48,16 +50,36 @@ def main(cfg: DictConfig):
         log_step(1, f"Setup completed. Device: {device}")
 
         # ==============================================================
+        # 1.5. Resume resolution (before WandB so the same run can resume)
+        # ==============================================================
+        resume_ctx = resolve_resume_context(cfg)
+        if resume_ctx.checkpoint_path is not None:
+            ckpt_epoch = (
+                resume_ctx.preloaded_checkpoint.get("epoch")
+                if resume_ctx.preloaded_checkpoint is not None
+                else "?"
+            )
+            log_step(
+                1,
+                f"Resume resolved ({resume_ctx.source}): {resume_ctx.checkpoint_path} "
+                f"(epoch={ckpt_epoch}, wandb_run_id={resume_ctx.wandb_run_id})",
+            )
+
+        # ==============================================================
         # 2. WandB
         # ==============================================================
         log_step(2, "Initializing WandB logger...")
+        wandb_run_id = resume_ctx.wandb_run_id if resume_ctx.resume_wandb else None
         logger = WandbLogger(
             enabled=cfg.logging.wandb.enabled,
             project=cfg.logging.wandb.project,
+            entity=cfg.logging.wandb.get("entity"),
             name=cfg.logging.experiment_name,
             config=OmegaConf.to_container(cfg, resolve=True),
             tags=list(cfg.logging.tags),
             mode=cfg.logging.wandb.mode,
+            run_id=wandb_run_id,
+            resume="must" if wandb_run_id is not None else None,
         )
         log_step(2, "WandB logger initialized.")
 
@@ -223,8 +245,17 @@ def main(cfg: DictConfig):
             cfg=cfg,
             device=device,
             logger=logger,
+            dataloader_generator=generator,
         )
         log_step(11, "Trainer initialized.")
+
+        if resume_ctx.checkpoint_path is not None:
+            log_step(11, f"Restoring training state from {resume_ctx.checkpoint_path}...")
+            trainer.load_resume_checkpoint(
+                checkpoint_path=resume_ctx.checkpoint_path,
+                preloaded_checkpoint=resume_ctx.preloaded_checkpoint,
+            )
+            resume_ctx.preloaded_checkpoint = None
 
         # ==============================================================
         # 12. Training
@@ -237,14 +268,18 @@ def main(cfg: DictConfig):
         # 13. Load best checkpoint
         # ==============================================================
         log_step(13, "Loading best checkpoint...")
-        checkpoint = torch.load(train_results["best_checkpoint"], map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        log_step(13, "Best checkpoint loaded.")
+        best_ckpt_path = Path(train_results["best_checkpoint"])
+        if best_ckpt_path.is_file():
+            checkpoint = load_checkpoint_file(best_ckpt_path)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            log_step(13, f"Best checkpoint loaded from {best_ckpt_path}.")
+        else:
+            log_step(13, f"Best checkpoint not found at {best_ckpt_path}; keeping current weights.")
 
         # ==============================================================
         # 14. Optional final test
         # ==============================================================
-        #test_results = {}
+        test_results = {}
 #
         #if test_loader is not None:
         #    log_step(14, "Starting final test evaluation...")
