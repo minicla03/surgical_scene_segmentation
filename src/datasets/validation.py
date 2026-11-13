@@ -340,49 +340,70 @@ def resolve_splits(dataset: Any, config: Any | None = None) -> dict[str, list[in
 # CLASS STATISTICS
 # ============================================================
 
-def class_pixel_statistics(
-    dataset: Any, indices: Iterable[int], split_name: str
-) -> pd.DataFrame:
-    """
-    Compute class statistics using ALL samples in a split.
-    For every class:
-        - number of samples containing the class;
-        - percentage of samples containing the class;
-        - number of pixels;
-        - percentage of pixels.
-    """
-    class_names = get_class_names(dataset)
-    class_count = len(class_names)
+def _resolve_group_key(samples: list[dict[str, Any]], group_key: str) -> str:
+    """Return group_key, falling back to 'surgery_id' (e.g. DSAD) if missing."""
+    if samples and group_key not in samples[0] and "surgery_id" in samples[0]:
+        return "surgery_id"
+    return group_key
 
-    pixel_counts = np.zeros(class_count, dtype=np.int64)
-    sample_presence = np.zeros(class_count, dtype=np.int64)
 
-    indices = list(indices)
-    total_samples = len(indices)
-    total_pixels = 0
+def compute_sample_counts(
+    dataset: Any, indices: Iterable[int]
+) -> dict[int, tuple[np.ndarray, int]]:
+    """
+    Load every requested mask exactly once.
+
+    Returns {sample_index: (pixels_per_class, ignored_pixels)} where
+    ignored_pixels are pixels whose label is outside [0, class_count).
+    A class is present in a sample iff pixels_per_class[class] > 0.
+    """
+    class_count = len(get_class_names(dataset))
+    results: dict[int, tuple[np.ndarray, int]] = {}
 
     for index in indices:
-        sample = _load_raw_sample(dataset, int(index))
-        mask = _to_numpy(sample["mask"])
+        index = int(index)
+        if index in results:
+            continue
 
+        mask = _to_numpy(_load_raw_sample(dataset, index)["mask"])
         if mask.ndim != 2:
             raise ValueError(f"Expected a 2D mask, got {mask.shape} at index {index}.")
 
-        total_pixels += mask.size
-        labels, counts = np.unique(mask, return_counts=True)
+        flat = mask.ravel().astype(np.int64)
+        valid = (flat >= 0) & (flat < class_count)
+        counts = np.bincount(flat[valid], minlength=class_count).astype(np.int64)
+        results[index] = (counts, int(flat.size - valid.sum()))
 
-        for label, count in zip(labels, counts):
-            label = int(label)
-            if not 0 <= label < class_count:
-                continue
+    return results
 
-            pixel_counts[label] += int(count)
-            sample_presence[label] += 1
+
+def _statistics_frame(
+    class_names: list[str],
+    sample_counts: list[tuple[np.ndarray, int]],
+    **labels: Any,
+) -> pd.DataFrame:
+    """
+    Aggregate per-sample counts into one row per class.
+    pixel_percentage is computed over VALID pixels (labels in range),
+    so it sums to 100 per table; ignored pixels are reported separately.
+    """
+    class_count = len(class_names)
+    pixel_counts = np.zeros(class_count, dtype=np.int64)
+    sample_presence = np.zeros(class_count, dtype=np.int64)
+    ignored_pixels = 0
+
+    for counts, ignored in sample_counts:
+        pixel_counts += counts
+        sample_presence += counts > 0
+        ignored_pixels += ignored
+
+    total_samples = len(sample_counts)
+    valid_pixels = int(pixel_counts.sum())
 
     rows = []
     for class_id, class_name in enumerate(class_names):
         rows.append({
-            "split": split_name,
+            **labels,
             "class_id": class_id,
             "class": class_name,
             "samples": int(sample_presence[class_id]),
@@ -391,57 +412,248 @@ def class_pixel_statistics(
             ),
             "pixels": int(pixel_counts[class_id]),
             "pixel_percentage": (
-                100.0 * pixel_counts[class_id] / total_pixels if total_pixels else 0.0
+                100.0 * pixel_counts[class_id] / valid_pixels if valid_pixels else 0.0
             ),
+            "total_samples": total_samples,
+            "valid_pixels": valid_pixels,
+            "ignored_pixels": int(ignored_pixels),
         })
 
     return pd.DataFrame(rows)
+
+
+def class_pixel_statistics(
+    dataset: Any,
+    indices: Iterable[int],
+    split_name: str,
+    cache: dict[int, tuple[np.ndarray, int]] | None = None,
+) -> pd.DataFrame:
+    """Class statistics (sample presence + pixels) over the given samples."""
+    indices = [int(i) for i in indices]
+    if cache is None:
+        cache = compute_sample_counts(dataset, indices)
+
+    return _statistics_frame(
+        get_class_names(dataset), [cache[i] for i in indices], split=split_name
+    )
+
+
+def class_statistics_by_video(
+    dataset: Any,
+    indices: Iterable[int] | None = None,
+    group_key: str = "video",
+    split_name: str | None = None,
+    cache: dict[int, tuple[np.ndarray, int]] | None = None,
+) -> pd.DataFrame:
+    """Same statistics computed separately for every video (group)."""
+    samples = get_samples(dataset)
+    group_key = _resolve_group_key(samples, group_key)
+    indices = list(range(len(samples))) if indices is None else [int(i) for i in indices]
+    if cache is None:
+        cache = compute_sample_counts(dataset, indices)
+
+    groups: dict[str, list[int]] = {}
+    for index in indices:
+        groups.setdefault(str(samples[index][group_key]), []).append(index)
+
+    class_names = get_class_names(dataset)
+    frames = []
+    for video, video_indices in sorted(groups.items()):
+        labels: dict[str, Any] = {}
+        if split_name is not None:
+            labels["split"] = split_name
+        labels["video"] = video
+        frames.append(
+            _statistics_frame(class_names, [cache[i] for i in video_indices], **labels)
+        )
+
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def class_statistics_global(
+    dataset: Any,
+    indices: Iterable[int] | None = None,
+    cache: dict[int, tuple[np.ndarray, int]] | None = None,
+) -> pd.DataFrame:
+    """Same statistics over the whole dataset (all samples, regardless of split)."""
+    indices = (
+        list(range(len(get_samples(dataset))))
+        if indices is None
+        else [int(i) for i in indices]
+    )
+    if cache is None:
+        cache = compute_sample_counts(dataset, indices)
+
+    return _statistics_frame(
+        get_class_names(dataset), [cache[i] for i in indices], scope="global"
+    )
+
+
+def class_video_presence(
+    dataset: Any,
+    indices: Iterable[int] | None = None,
+    group_key: str = "video",
+    cache: dict[int, tuple[np.ndarray, int]] | None = None,
+    **labels: Any,
+) -> pd.DataFrame:
+    """
+    For every class: in how many videos it appears and in which ones.
+
+    Columns:
+        videos             number of videos containing the class (>= 1 pixel)
+        total_videos       number of videos considered
+        video_percentage   videos / total_videos * 100
+        video_list         sorted list of the videos containing the class
+        frames_per_video   {video: frames containing the class}
+        top_video          video holding the largest share of the class pixels
+        top_video_pixel_share  % of the class pixels belonging to top_video
+                               (100 -> the class lives in a single video)
+    """
+    samples = get_samples(dataset)
+    group_key = _resolve_group_key(samples, group_key)
+    indices = (
+        list(range(len(samples))) if indices is None else [int(i) for i in indices]
+    )
+    if cache is None:
+        cache = compute_sample_counts(dataset, indices)
+
+    class_names = get_class_names(dataset)
+    class_count = len(class_names)
+
+    groups: dict[str, list[int]] = {}
+    for index in indices:
+        groups.setdefault(str(samples[index][group_key]), []).append(index)
+
+    video_pixels: dict[str, np.ndarray] = {}
+    video_frames: dict[str, np.ndarray] = {}
+    for video, video_indices in groups.items():
+        video_pixels[video] = np.sum([cache[i][0] for i in video_indices], axis=0)
+        video_frames[video] = np.sum([cache[i][0] > 0 for i in video_indices], axis=0)
+
+    rows = []
+    for class_id, class_name in enumerate(class_names):
+        present = sorted(v for v in groups if video_pixels[v][class_id] > 0)
+        class_pixels = sum(int(video_pixels[v][class_id]) for v in present)
+        if present:
+            top = max(present, key=lambda v: video_pixels[v][class_id])
+            top_share = 100.0 * video_pixels[top][class_id] / class_pixels
+        else:
+            top, top_share = None, 0.0
+
+        rows.append({
+            **labels,
+            "class_id": class_id,
+            "class": class_name,
+            "videos": len(present),
+            "total_videos": len(groups),
+            "video_percentage": 100.0 * len(present) / len(groups) if groups else 0.0,
+            "video_list": present,
+            "frames_per_video": {v: int(video_frames[v][class_id]) for v in present},
+            "top_video": top,
+            "top_video_pixel_share": top_share,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def class_video_matrix(
+    dataset: Any,
+    indices: Iterable[int] | None = None,
+    group_key: str = "video",
+    cache: dict[int, tuple[np.ndarray, int]] | None = None,
+) -> pd.DataFrame:
+    """Frames containing each class: rows = videos, columns = classes."""
+    samples = get_samples(dataset)
+    group_key = _resolve_group_key(samples, group_key)
+    indices = (
+        list(range(len(samples))) if indices is None else [int(i) for i in indices]
+    )
+    if cache is None:
+        cache = compute_sample_counts(dataset, indices)
+
+    groups: dict[str, list[int]] = {}
+    for index in indices:
+        groups.setdefault(str(samples[index][group_key]), []).append(index)
+
+    data = {
+        video: np.sum([cache[i][0] > 0 for i in idxs], axis=0)
+        for video, idxs in sorted(groups.items())
+    }
+    return pd.DataFrame.from_dict(data, orient="index", columns=get_class_names(dataset))
 
 
 # ============================================================
 # MAIN VALIDATOR
 # ============================================================
 
-def validate_dataset(dataset: Any, config: Any | None = None) -> dict[str, Any]:
+def validate_dataset(
+    dataset: Any, config: Any | None = None, group_key: str = "video"
+) -> dict[str, Any]:
     """
-    Compute dataset class distribution.
-    
-    IMPORTANT:
-        Statistics are computed on the COMPLETE dataset split.
-    
-    No sampling or max_samples limit is applied.
-    
+    Compute dataset class distribution on the COMPLETE dataset
+    (no sampling). Each mask is read only once.
+
     Returns:
         {
-            "splits": ...,
-            "split_summary": ...,
-            "class_statistics": ...
+            "splits": {split: [indices]},
+            "split_summary": samples per split,
+            "class_statistics": per split,
+            "video_statistics": per video (and split),
+            "global_statistics": whole dataset,
+            "video_presence": videos containing each class, per split,
+            "global_video_presence": same, over the whole dataset
         }
     """
     splits = resolve_splits(dataset, config)
 
-    # --------------------------------------------------------
-    # Number of samples per split
-    # --------------------------------------------------------
+    all_indices = sorted({i for idx in splits.values() for i in idx})
+    cache = compute_sample_counts(dataset, all_indices)
+
     split_summary = pd.DataFrame([
-        {"split": split_name, "samples": len(indices)}
-        for split_name, indices in splits.items()
+        {"split": name, "samples": len(idx)} for name, idx in splits.items()
     ])
 
-    # --------------------------------------------------------
-    # Class statistics
-    # --------------------------------------------------------
-    statistics = [
-        class_pixel_statistics(
-            dataset=dataset, indices=indices, split_name=split_name
-        )
-        for split_name, indices in splits.items()
-    ]
+    class_statistics = pd.concat(
+        [
+            class_pixel_statistics(dataset, idx, name, cache=cache)
+            for name, idx in splits.items()
+        ],
+        ignore_index=True,
+    )
 
-    class_statistics = pd.concat(statistics, ignore_index=True)
+    video_statistics = pd.concat(
+        [
+            class_statistics_by_video(
+                dataset, idx, group_key=group_key, split_name=name, cache=cache
+            )
+            for name, idx in splits.items()
+            if len(idx)
+        ],
+        ignore_index=True,
+    )
+
+    global_statistics = class_statistics_global(dataset, all_indices, cache=cache)
+
+    video_presence = pd.concat(
+        [
+            class_video_presence(
+                dataset, idx, group_key=group_key, cache=cache, split=name
+            )
+            for name, idx in splits.items()
+            if len(idx)
+        ],
+        ignore_index=True,
+    )
+    global_video_presence = class_video_presence(
+        dataset, all_indices, group_key=group_key, cache=cache, scope="global"
+    )
 
     return {
         "splits": splits,
         "split_summary": split_summary,
         "class_statistics": class_statistics,
+        "video_statistics": video_statistics,
+        "global_statistics": global_statistics,
+        "video_presence": video_presence,
+        "global_video_presence": global_video_presence,
     }
