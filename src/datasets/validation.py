@@ -556,13 +556,22 @@ def class_video_presence(
     return pd.DataFrame(rows)
 
 
-def class_video_matrix(
+def class_video_table(
     dataset: Any,
     indices: Iterable[int] | None = None,
     group_key: str = "video",
     cache: dict[int, tuple[np.ndarray, int]] | None = None,
+    split_by_video: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    """Frames containing each class: rows = videos, columns = classes."""
+    """
+    Video x class table with frames and pixels for every class.
+
+    Rows    = videos (index "video"; optional first level "split" when
+              split_by_video is given, e.g. {"video01": "train", ...}).
+    Columns = MultiIndex (class, metric) with metric in {"frames", "pixels"}:
+              frames = number of frames of the video containing the class,
+              pixels = total pixels of the class in the video.
+    """
     samples = get_samples(dataset)
     group_key = _resolve_group_key(samples, group_key)
     indices = (
@@ -575,11 +584,56 @@ def class_video_matrix(
     for index in indices:
         groups.setdefault(str(samples[index][group_key]), []).append(index)
 
-    data = {
-        video: np.sum([cache[i][0] > 0 for i in idxs], axis=0)
-        for video, idxs in sorted(groups.items())
-    }
-    return pd.DataFrame.from_dict(data, orient="index", columns=get_class_names(dataset))
+    class_names = get_class_names(dataset)
+    columns = pd.MultiIndex.from_product(
+        [class_names, ["frames", "pixels"]], names=["class", "metric"]
+    )
+
+    videos = sorted(groups)
+    if split_by_video is not None:
+        videos = sorted(videos, key=lambda v: (split_by_video.get(v, ""), v))
+
+    rows = []
+    for video in videos:
+        counts = np.stack([cache[i][0] for i in groups[video]])  # (frames, classes)
+        frames = (counts > 0).sum(axis=0)
+        pixels = counts.sum(axis=0)
+        row = np.empty(2 * len(class_names), dtype=np.int64)
+        row[0::2], row[1::2] = frames, pixels
+        rows.append(row)
+
+    data = np.vstack(rows) if rows else np.empty((0, len(columns)), dtype=np.int64)
+    if split_by_video is not None:
+        index = pd.MultiIndex.from_tuples(
+            [(split_by_video.get(v, "?"), v) for v in videos], names=["split", "video"]
+        )
+    else:
+        index = pd.Index(videos, name="video")
+    return pd.DataFrame(data, index=index, columns=columns)
+
+
+def class_video_matrix(
+    dataset: Any,
+    indices: Iterable[int] | None = None,
+    group_key: str = "video",
+    cache: dict[int, tuple[np.ndarray, int]] | None = None,
+) -> pd.DataFrame:
+    """Frames containing each class only (rows = videos, columns = classes)."""
+    table = class_video_table(dataset, indices, group_key, cache)
+    return table.xs("frames", axis=1, level="metric")
+
+
+def flag_classes(
+    global_video_presence: pd.DataFrame,
+    rare_video_threshold: int = 3,
+    concentration_threshold: float = 50.0,
+) -> list[str]:
+    """Classes present in <= rare_video_threshold videos or concentrated in one video."""
+    p = global_video_presence
+    mask = (p["videos"] <= rare_video_threshold) | (
+        (p["top_video_pixel_share"] >= concentration_threshold) & (p["videos"] > 0)
+    )
+    return p.loc[mask, "class"].tolist()
 
 
 # ============================================================
@@ -601,7 +655,8 @@ def validate_dataset(
             "video_statistics": per video (and split),
             "global_statistics": whole dataset,
             "video_presence": videos containing each class, per split,
-            "global_video_presence": same, over the whole dataset
+            "global_video_presence": same, over the whole dataset,
+            "video_class_table": video x class table (frames + pixels per class)
         }
     """
     splits = resolve_splits(dataset, config)
@@ -648,6 +703,18 @@ def validate_dataset(
         dataset, all_indices, group_key=group_key, cache=cache, scope="global"
     )
 
+    all_samples = get_samples(dataset)
+    video_col = _resolve_group_key(all_samples, group_key)
+    split_by_video = {
+        str(all_samples[i][video_col]): name
+        for name, idx in splits.items()
+        for i in idx
+    }
+    video_class_table = class_video_table(
+        dataset, all_indices, group_key=group_key, cache=cache,
+        split_by_video=split_by_video,
+    )
+
     return {
         "splits": splits,
         "split_summary": split_summary,
@@ -656,4 +723,5 @@ def validate_dataset(
         "global_statistics": global_statistics,
         "video_presence": video_presence,
         "global_video_presence": global_video_presence,
+        "video_class_table": video_class_table,
     }
