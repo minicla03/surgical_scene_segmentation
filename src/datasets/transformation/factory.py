@@ -155,7 +155,8 @@ class TransformFactory:
         transforms = []
         transforms.extend(self._build_scaling(augmentation))
         transforms.extend(self._build_rotation(augmentation))
-        transforms.extend(self._build_translation(augmentation))
+        image_size = (self.config.get("preprocessing", {}).get("image", {})).get("size")
+        transforms.extend(self._build_translation(augmentation, image_size))
         transforms.extend(self._build_horizontal_flip(augmentation))
         transforms.extend(self._build_vertical_flip(augmentation))
         transforms.extend(self._build_brightness(augmentation))
@@ -205,17 +206,24 @@ class TransformFactory:
         ]
 
     @staticmethod
-    def _build_translation(augmentation: dict) -> list:
+    def _build_translation(augmentation: dict, image_size=None) -> list:
         config = augmentation.get("translation", {})
         if not config.get("enabled", False):
             return []
 
+        if image_size is None:
+            raise ValueError("Translation augmentation requires preprocessing.image.size.")
+
+        # MONAI expects translate_range in PIXELS; the config gives a fraction
+        # of the image size, so convert it per axis (H, W), symmetric around 0.
         translation_range = config.get("range", [-0.05, 0.05])
+        fraction = max(abs(float(v)) for v in translation_range)
+        height, width = image_size
         return [
             RandAffined(
                 keys=["image", "mask"],
                 prob=config.get("probability", 1.0),
-                translate_range=tuple(translation_range),
+                translate_range=(fraction * height, fraction * width),
                 mode=("bilinear", "nearest"),
                 padding_mode="border",
             )

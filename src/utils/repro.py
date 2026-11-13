@@ -30,3 +30,10 @@ def seed_worker(worker_id: int) -> None:
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+    # MONAI random transforms own a private RandomState that the global seeds
+    # above do not control: seed it explicitly, differently for every worker.
+    info = torch.utils.data.get_worker_info()
+    transform = getattr(getattr(info, "dataset", None), "transform", None)
+    if transform is not None and hasattr(transform, "set_random_state"):
+        transform.set_random_state(seed=worker_seed)

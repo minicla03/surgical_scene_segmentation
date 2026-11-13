@@ -67,12 +67,13 @@ augmentation:
 
     gaussian_blur:
       enabled: true
-      probability: 1.0
-      kernel_sizes: [3, 5, 7]
-      sigmas: [0.8, 1.1, 1.4]
+      probability: 0.3
+      sigmas: [0.8, 1.4]   # (min, max) of the sampled sigma
 
+    # Disabled: the 256x256 crop padded the 240-px height with synthetic rows and
+    # made training differ from the full-image evaluation (other datasets use no crop).
     random_crop:
-      enabled: true
+      enabled: false
       size: [256, 256]
 
   validation:
