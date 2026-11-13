@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from src.utils.qualitative import QualitativeSampler
 from src.utils.checkpoint import (
     atomic_torch_save,
     build_checkpoint_paths,
@@ -62,7 +63,9 @@ class Trainer:
         qualitative_cfg = logging_cfg.get("qualitative", {})
         self.qualitative_enabled = bool(qualitative_cfg.get("enabled", True))
         self.qualitative_freq = max(1, int(qualitative_cfg.get("frequency", 1)))
-        self.qualitative_max_samples = max(1, int(qualitative_cfg.get("max_samples", 4)))
+        self.qualitative_cfg = qualitative_cfg
+        self.num_classes = int(getattr(self.metric_manager, "num_classes", len(self.class_labels)))
+        self.seed = int((cfg.get("experiment") or {}).get("seed", 0))
 
         early_stopping_cfg = train_cfg.get("early_stopping", {})
         self.early_stopping_enabled = bool(early_stopping_cfg.get("enabled", True))
@@ -81,6 +84,9 @@ class Trainer:
                 f"Early stopping monitor '{self.monitor}' is not available. "
                 f"Available metrics: {sorted(available_metrics)}"
             )
+
+        if self.logger is not None and hasattr(self.logger, "set_monitor"):
+            self.logger.set_monitor(self.monitor, self.monitor_mode)
 
         self.best_score = float("inf") if self.monitor_mode == "min" else -float("inf")
         self.best_epoch = 0
@@ -222,7 +228,8 @@ class Trainer:
             if (step + 1) % self.accumulation_steps == 0 or (step + 1) == len(self.train_loader):
                 self._optimizer_step()
 
-            self.metric_manager.update(predictions.detach(), masks.detach())
+            # HD95 is too slow to run every training step: validation/test only
+            self.metric_manager.update(predictions.detach(), masks.detach(), extra=False)
 
             running_loss += loss.detach().item()
             num_batches += 1
@@ -247,7 +254,12 @@ class Trainer:
 
         running_loss = 0.0
         num_batches = 0
-        qualitative_batch = None
+
+        sampler = None
+        if self.qualitative_enabled and epoch % self.qualitative_freq == 0:
+            sampler = QualitativeSampler.from_config(
+                self.qualitative_cfg, self.num_classes, seed=self.seed
+            )
 
         progress = tqdm(
             self.val_loader,
@@ -255,7 +267,7 @@ class Trainer:
             leave=False,
         )
 
-        for batch_index, batch in enumerate(progress):
+        for batch in progress:
             images, masks = self._prepare_batch(batch)
 
             with self._autocast():
@@ -271,29 +283,16 @@ class Trainer:
             running_loss += loss.detach().item()
             num_batches += 1
 
-            if (
-                batch_index == 0
-                and self.qualitative_enabled
-                and epoch % self.qualitative_freq  == 0
-            ):
-                n_samples = min(self.qualitative_max_samples, images.shape[0])
-                
-                prediction = predictions[:n_samples]
-
-                if prediction.ndim == 4:
-                    prediction = prediction.argmax(dim=1)
-
-                qualitative_batch = {
-                    "image": images[:n_samples].detach().cpu(),
-                    "mask": masks[:n_samples].detach().cpu(),
-                    "prediction": prediction.detach().cpu(),
-                }
+            if sampler is not None:
+                sampler.update(images, masks, predictions.detach())
 
             progress.set_postfix(loss=f"{loss.item():.4f}")
 
         metrics = self.metric_manager.compute()
         loss_value = running_loss / max(num_batches, 1)
         per_class = self.metric_manager.compute_per_class()
+
+        qualitative_batch = sampler.result() if sampler is not None else None
 
         return loss_value, metrics, per_class, qualitative_batch
 

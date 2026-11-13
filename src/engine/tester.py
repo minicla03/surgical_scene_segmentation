@@ -8,6 +8,7 @@ import torch
 from tqdm import tqdm
 
 from src.utils.checkpoint import load_checkpoint_file
+from src.utils.qualitative import QualitativeSampler
 
 
 class Tester:
@@ -33,7 +34,9 @@ class Tester:
         logging_cfg = cfg.get("logging") or {}
         qualitative_cfg = logging_cfg.get("qualitative") or {}
         self.qualitative_enabled = bool(qualitative_cfg.get("enabled", True))
-        self.qualitative_max_samples = max(1, int(qualitative_cfg.get("max_samples", 4)))
+        self.qualitative_cfg = qualitative_cfg
+        self.num_classes = int(getattr(self.metric_manager, "num_classes", len(self.class_labels)))
+        self.seed = int((cfg.get("experiment") or {}).get("seed", 0))
 
         self.metric_names = list(self.metric_manager.names)
 
@@ -142,7 +145,11 @@ class Tester:
         num_batches = 0
         total_images = 0
         total_model_time = 0.0
-        qualitative_batch = None
+        sampler = (
+            QualitativeSampler.from_config(self.qualitative_cfg, self.num_classes, seed=self.seed)
+            if self.qualitative_enabled
+            else None
+        )
 
         progress = tqdm(
             self.test_loader,
@@ -150,7 +157,7 @@ class Tester:
             leave=False,
         )
 
-        for batch_index, batch in enumerate(progress):
+        for batch in progress:
             images, masks = self._prepare_batch(batch)
 
             if self.device.type == "cuda":
@@ -182,22 +189,12 @@ class Tester:
             running_loss += loss_value
             num_batches += 1
 
-            if batch_index == 0 and self.qualitative_enabled:
-                n_samples = min(self.qualitative_max_samples, images.shape[0])
-                prediction = predictions[:n_samples]
-
-                if prediction.ndim == 4 and prediction.shape[1] > 1:
-                    prediction = prediction.argmax(dim=1)
-                elif prediction.ndim == 4:
-                    prediction = prediction.squeeze(1)
-
-                qualitative_batch = {
-                    "image": images[:n_samples].detach().cpu(),
-                    "mask": masks[:n_samples].detach().cpu(),
-                    "prediction": prediction.detach().cpu(),
-                }
+            if sampler is not None:
+                sampler.update(images, masks, predictions.detach())
 
             progress.set_postfix(loss=f"{loss_value:.4f}")
+
+        qualitative_batch = sampler.result() if sampler is not None else None
 
         metrics = self.metric_manager.compute()
         per_class_results = self.metric_manager.compute_per_class()
@@ -256,22 +253,29 @@ class Tester:
         metrics = results["metrics"]
         per_class = results["per_class"]
 
-        log_data: dict[str, float] = {}
-        for key, value in metrics.items():
-            log_data[f"test/{key}"] = float(value)
-        for key, value in per_class.items():
-            log_data[f"test/{key}"] = float(value)
-
         qualitative = results.get("qualitative")
         if self.qualitative_enabled and qualitative is not None:
+            class_labels = self._resolve_class_labels()
             self.logger.log_qualitative(
                 images=qualitative["image"],
                 masks=qualitative["mask"],
                 predictions=qualitative["prediction"],
-                class_labels=self._resolve_class_labels(),
+                class_labels=class_labels,
                 scenario="test",
-                max_samples=self.qualitative_max_samples,
                 table_name="qualitative/test",
+                groups=qualitative.get("group"),
+                scores=qualitative.get("score"),
+                indices=qualitative.get("index"),
             )
+            if qualitative.get("confusion_matrix") is not None:
+                self.logger.log_confusion_matrix(
+                    qualitative["confusion_matrix"],
+                    class_labels=class_labels,
+                    key="test/confusion_matrix",
+                )
 
-        self.logger.log(log_data, commit=True)
+        self.logger.log_test_results(
+            {key: float(value) for key, value in metrics.items()},
+            {key: float(value) for key, value in per_class.items()},
+            commit=True,
+        )

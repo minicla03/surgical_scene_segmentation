@@ -80,6 +80,9 @@ def main(cfg: DictConfig):
             mode=cfg.logging.wandb.mode,
             run_id=wandb_run_id,
             resume="must" if wandb_run_id is not None else None,
+            job_type="train",
+            group=cfg.logging.wandb.get("group"),
+            notes=cfg.logging.wandb.get("notes"),
         )
         log_step(2, "WandB logger initialized.")
 
