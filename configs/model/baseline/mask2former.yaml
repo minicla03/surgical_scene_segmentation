@@ -12,6 +12,12 @@ implementation:
 pretrained:
   enabled: false
   checkpoint: facebook/mask2former-swin-base-ade-semantic
+  # Applied by TransformFactory only when pretrained.enabled=true.
+  # Input is first scaled to [0,1], then (x - mean) / std (ImageNet stats).
+  normalization:
+    enabled: true
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
 
 architecture:
   _target_: src.models.mask2former_wrapper.Mask2FormerWrapper

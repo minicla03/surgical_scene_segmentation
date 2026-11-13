@@ -1,10 +1,11 @@
 from monai.transforms.compose import Compose
 from monai.transforms.croppad.dictionary import RandSpatialCropd, SpatialPadd
-from monai.transforms.intensity.dictionary import RandGaussianSmoothd, ScaleIntensityd, RandShiftIntensityd, RandAdjustContrastd
+from monai.transforms.intensity.dictionary import NormalizeIntensityd, RandGaussianSmoothd, ScaleIntensityd, RandShiftIntensityd, RandAdjustContrastd
 from monai.transforms.spatial.dictionary import RandAffined, RandFlipd, Resized
 from monai.transforms.utility.dictionary import EnsureChannelFirstd, EnsureTyped
 
 import math
+import numpy as np
 import torch
 
 
@@ -17,13 +18,41 @@ class TransformFactory:
     def build_train_transform(self) -> Compose:
         transforms = self._build_preprocessing()
         transforms.extend(self._build_augmentation())
+        transforms.extend(self._build_pretrained_normalization())
         return Compose(transforms)
 
     def build_val_transform(self) -> Compose:
-        return Compose(self._build_preprocessing())
+        transforms = self._build_preprocessing()
+        transforms.extend(self._build_pretrained_normalization())
+        return Compose(transforms)
 
     def build_test_transform(self) -> Compose:
-        return Compose(self._build_preprocessing())
+        transforms = self._build_preprocessing()
+        transforms.extend(self._build_pretrained_normalization())
+        return Compose(transforms)
+
+    # =========================================================
+    # PRETRAINED NORMALIZATION
+    # =========================================================
+
+    def _build_pretrained_normalization(self) -> list:
+        """Mean/std normalization, applied last and only when the model uses
+        pretrained weights (model.pretrained.enabled) and
+        model.pretrained.normalization.enabled is true."""
+        model_cfg = self.config.get("model") or {}
+        pretrained = model_cfg.get("pretrained") or {}
+        norm = pretrained.get("normalization") or {}
+
+        if not (pretrained.get("enabled", False) and norm.get("enabled", False)):
+            return []
+
+        mean = np.asarray(list(norm["mean"]), dtype=np.float32).reshape(-1, 1, 1)
+        std = np.asarray(list(norm["std"]), dtype=np.float32).reshape(-1, 1, 1)
+        return [
+            NormalizeIntensityd(
+                keys=["image"], subtrahend=mean, divisor=std, channel_wise=False, dtype=np.float32
+            )
+        ]
 
     # =========================================================
     # PREPROCESSING
