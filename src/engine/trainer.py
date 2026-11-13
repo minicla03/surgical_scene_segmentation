@@ -218,14 +218,19 @@ class Trainer:
 
                     loss = self.loss_fn(predictions, masks)
 
-            loss_for_backward = loss / self.accumulation_steps
+            # Average over the real size of the accumulation group: the last group
+            # of the epoch can be smaller than accumulation_steps.
+            total_batches = len(self.train_loader)
+            group_start = (step // self.accumulation_steps) * self.accumulation_steps
+            group_size = min(self.accumulation_steps, total_batches - group_start)
+            loss_for_backward = loss / group_size
 
             if self.scaler is not None:
                 self.scaler.scale(loss_for_backward).backward()
             else:
                 loss_for_backward.backward()
 
-            if (step + 1) % self.accumulation_steps == 0 or (step + 1) == len(self.train_loader):
+            if (step + 1) % self.accumulation_steps == 0 or (step + 1) == total_batches:
                 self._optimizer_step()
 
             # HD95 is too slow to run every training step: validation/test only
