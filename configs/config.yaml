@@ -23,6 +23,16 @@ logging:
     project: surgical_scene_segmentation
     entity: mininnoclaudio-unimore
     mode: online
+    group: null        # e.g. same value for several seeds of one experiment
+    notes: null
+
+  qualitative:
+    enabled: true
+    frequency: 1       # every N validation epochs
+    num_worst: 4       # lowest per-image Dice
+    num_best: 2        # highest per-image Dice
+    num_random: 2      # uniformly sampled (fixed seed)
+    exclude_classes: []  # class ids ignored when scoring images (e.g. [0] for background)
 
   experiment_name: ${name}_${model.name}
   tags: []
