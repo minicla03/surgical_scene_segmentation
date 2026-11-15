@@ -265,20 +265,16 @@ class MetricManager:
                     results[name] = self._masked_macro(buffer)
                 continue
 
-            buffer = self._metric_buffer(metric) if self._eval_mask is not None else None
-            if buffer is not None and buffer.shape[1] == self.num_classes:
-                results[name] = self._masked_macro(buffer)
+            buffer = self._metric_buffer(metric)
+            if buffer is None:
+                results[name] = float("nan")
                 continue
-
-            value = metric.aggregate()
-
-            if isinstance(value, tuple):
-                value = value[0]
-
-            if torch.is_tensor(value):
-                value = value.detach().cpu().nanmean().item()
-
-            results[name] = float(value)
+            if buffer.shape[1] != self.num_classes:
+                raise RuntimeError(
+                    f"Metric '{name}' buffer has {buffer.shape[1]} class columns, expected "
+                    f"{self.num_classes} (include_background=False is not supported)."
+                )
+            results[name] = self._masked_macro(buffer)
 
         for name, values in self.accumulated_per_class().items():
             results[name] = float(values.nanmean().item()) if not values.isnan().all() else float("nan")

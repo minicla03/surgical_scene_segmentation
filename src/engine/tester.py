@@ -195,6 +195,9 @@ class Tester:
             progress.set_postfix(loss=f"{loss_value:.4f}")
 
         qualitative_batch = sampler.result() if sampler is not None else None
+        if qualitative_batch is not None:
+            # same matrix the accumulated Dice/IoU are computed from
+            qualitative_batch["confusion_matrix"] = self.metric_manager.confusion_matrix().numpy()
 
         metrics = self.metric_manager.compute()
         per_class_results = self.metric_manager.compute_per_class()

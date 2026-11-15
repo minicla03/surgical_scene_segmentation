@@ -9,7 +9,7 @@ import wandb
 
 from pathlib import Path
 
-from src.utils.checkpoint import atomic_torch_save
+from src.utils.checkpoint import atomic_torch_save, sanitize_artifact_name
 
 _PER_CLASS_RE = re.compile(r"^(?P<metric>.+?)_class_(?P<cls>.+)$")
 
@@ -486,6 +486,20 @@ class WandbLogger:
         if "best_epoch" in train_results:
             summary["train/best_epoch"] = train_results["best_epoch"]
 
+        # Best-epoch and last-epoch results (last = epoch where training stopped).
+        # Per-class values are NaN for classes that cannot be evaluated.
+        for tag in ("best", "last", "test_best", "test_last"):
+            for key, value in (train_results.get(f"{tag}_metrics") or {}).items():
+                if isinstance(value, (int, float, np.floating, np.integer)):
+                    summary[f"final/{tag}/{key}"] = float(value)
+            for key, value in (train_results.get(f"{tag}_per_class") or {}).items():
+                if isinstance(value, (int, float, np.floating, np.integer)):
+                    summary[per_class_log_key(f"final/{tag}", key)] = float(value)
+            if f"{tag}_epoch" in train_results:
+                summary[f"final/{tag}_epoch"] = int(train_results[f"{tag}_epoch"])
+        if "stopped_early" in train_results:
+            summary["final/stopped_early"] = bool(train_results["stopped_early"])
+
         if "best_score" in train_results:
             summary["train/best_score"] = float(train_results["best_score"])
 
@@ -504,6 +518,73 @@ class WandbLogger:
         if wandb.run is not None:
             for key, value in summary.items():
                 wandb.run.summary[key] = value
+
+    # K-fold
+    @staticmethod
+    def _table_frame(frame):
+        """Make a DataFrame W&B-friendly (lists -> comma separated strings)."""
+        frame = frame.copy()
+        for column in frame.columns:
+            frame[column] = frame[column].map(
+                lambda v: ", ".join(map(str, v)) if isinstance(v, (list, tuple)) else v
+            )
+        return frame
+
+    def log_kfold_plan(self, plan: Any, fold_index: int, group: str | None = None) -> None:
+        """Log the fold tables, the evaluable classes and the ``folds.json`` artifact."""
+        if not self.is_active:
+            return
+
+        wandb.log({
+            "kfold/folds": wandb.Table(dataframe=self._table_frame(plan.fold_table())),
+            "kfold/coverage": wandb.Table(dataframe=self._table_frame(plan.coverage_table())),
+        })
+
+        evaluable = plan.evaluable_classes(fold_index)
+        wandb.run.summary["kfold/fold_index"] = int(fold_index)
+        wandb.run.summary["kfold/n_folds"] = int(plan.n_folds)
+        wandb.run.summary["kfold/evaluable_classes"] = [
+            n for n, ok in zip(plan.class_names, evaluable) if ok
+        ]
+        wandb.run.summary["kfold/nan_classes"] = [
+            n for n, ok in zip(plan.class_names, evaluable) if not ok
+        ]
+
+        path = plan.save(Path(wandb.run.dir) / "folds.json")
+        artifact = wandb.Artifact(
+            sanitize_artifact_name(f"{group or wandb.run.name}_folds"), type="kfold-split"
+        )
+        artifact.add_file(str(path), name="folds.json")
+        wandb.log_artifact(artifact)
+
+    def log_final_qualitative(
+        self,
+        best: tuple[int, dict[str, Any]] | None,
+        last: tuple[int, dict[str, Any]] | None,
+        class_labels: dict[int, str] | None = None,
+    ) -> None:
+        """Log the qualitative tables of the best and of the last validation epoch."""
+        if not self.is_active:
+            return
+
+        payload: dict[str, Any] = {}
+        for name, item in (("best", best), ("last", last)):
+            if item is None:
+                continue
+            epoch, batch = item
+            payload[f"qualitative/{name}"] = self._build_qualitative_table(
+                images=batch["image"],
+                labels=batch["mask"],
+                predictions=batch["prediction"],
+                class_labels=class_labels or {},
+                scenario="val",
+                epoch=epoch,
+                groups=batch.get("group"),
+                scores=batch.get("score"),
+                indices=batch.get("index"),
+            )
+        if payload:
+            wandb.log(payload)
 
     # Run management
     def finish(self) -> None:

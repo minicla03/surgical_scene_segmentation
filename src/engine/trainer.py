@@ -8,6 +8,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from omegaconf import OmegaConf
+
 from src.utils.qualitative import QualitativeSampler
 from src.utils.checkpoint import (
     atomic_torch_save,
@@ -58,6 +60,9 @@ class Trainer:
         self.max_epochs = int(train_cfg.get("max_epochs", 50))
         self.accumulation_steps = max(1, int(train_cfg.get("accumulation_steps", 1)))
         self.eval_freq = max(1, int(train_cfg.get("eval_freq", 1)))
+        # HD95 is slow: during training it is computed every N validations (0 = never).
+        # The final evaluation (start_experiment) always computes it.
+        self.hd95_freq = max(0, int((cfg.get("evaluation") or {}).get("hd95_freq", 10)))
 
         logging_cfg = cfg.get("logging", {})
         qualitative_cfg = logging_cfg.get("qualitative", {})
@@ -70,11 +75,17 @@ class Trainer:
         early_stopping_cfg = train_cfg.get("early_stopping", {})
         self.early_stopping_enabled = bool(early_stopping_cfg.get("enabled", True))
         self.patience = int(early_stopping_cfg.get("patience", 10))
-        self.monitor = str(early_stopping_cfg.get("monitor", "dice"))
+        self.monitor = str(early_stopping_cfg.get("monitor", "dice_acc"))
         self.monitor_mode = str(early_stopping_cfg.get("mode", "max")).lower()
+        # An epoch counts as an improvement only if it beats the best score by MORE than min_delta
+        # (same convention as Keras): smaller gains are noise and neither reset the patience counter
+        # nor replace the best checkpoint.
+        self.min_delta = float(early_stopping_cfg.get("min_delta", 0.0))
 
         if self.monitor_mode not in {"min", "max"}:
             raise ValueError("early_stopping.mode must be either 'min' or 'max'")
+        if self.min_delta < 0:
+            raise ValueError("early_stopping.min_delta must be >= 0")
 
         self.metric_names = list(self.metric_manager.names)
         available_metrics = set(self.metric_names) | {"loss", "fps"}
@@ -91,6 +102,14 @@ class Trainer:
         self.best_score = float("inf") if self.monitor_mode == "min" else -float("inf")
         self.best_epoch = 0
         self.best_metrics: dict[str, float] = {}
+        self.best_per_class: dict[str, float] = {}
+        self.last_epoch = 0
+        self.last_metrics: dict[str, float] = {}
+        self.last_per_class: dict[str, float] = {}
+        self.stopped_early = False
+        # qualitative samples kept in memory as (epoch, batch) to log best/last at the end
+        self._best_qualitative: tuple[int, dict[str, Any]] | None = None
+        self._last_qualitative: tuple[int, dict[str, Any]] | None = None
         self.epochs_without_improvement = 0
         self.start_epoch = 1
         self.history: list[dict[str, Any]] = []
@@ -100,8 +119,10 @@ class Trainer:
         self.save_last = bool(ckpt_cfg.get("save_last", True))
         save_every = ckpt_cfg.get("save_every_n_epochs", None)
         self.save_every_n_epochs = int(save_every) if save_every is not None else None
+        # W&B: the weights of the best and of the last epoch are uploaded ONCE, at the end of the
+        # training (weights only, no optimizer state). Nothing is uploaded during the training.
         self.upload_best_to_wandb = bool(ckpt_cfg.get("upload_best_to_wandb", True))
-        self.upload_last_to_wandb = bool(ckpt_cfg.get("upload_last_to_wandb", False))
+        self.upload_last_to_wandb = bool(ckpt_cfg.get("upload_last_to_wandb", True))
 
         self.output_dir = resolve_checkpoint_dir(cfg)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -117,9 +138,17 @@ class Trainer:
         )
         self.best_checkpoint_path = ckpt_paths["best"]
         self.last_checkpoint_path = ckpt_paths["last"]
-        self.artifact_base_name = sanitize_artifact_name(
-            f"{self.cfg.data.name}_{self.cfg.model.name}_lr_{self.initial_lr_str}"
-        )
+        # weights-only copies (small, for inference); overwritten at the end of every training
+        self.best_weights_path = self.best_checkpoint_path.with_name(f"weights_{self.best_checkpoint_path.name}")
+        self.last_weights_path = self.last_checkpoint_path.with_name(f"weights_{self.last_checkpoint_path.name}")
+        artifact_name = f"{self.cfg.data.name}_{self.cfg.model.name}_lr_{self.initial_lr_str}"
+        split_cfg = (cfg.get("data") or {}).get("split") or {}
+        if split_cfg.get("strategy") == "kfold":
+            artifact_name += f"_fold{int(split_cfg.get('fold_index', 0))}"
+        experiment_cfg = cfg.get("experiment") or {}
+        if experiment_cfg.get("seed_runs"):
+            artifact_name += f"_seed{int(experiment_cfg.get('seed', 0))}"
+        self.artifact_base_name = sanitize_artifact_name(artifact_name)
 
     # Forward
     def _forward(
@@ -251,9 +280,20 @@ class Trainer:
     # Validation
     @torch.no_grad()
     def validate(
-        self, epoch: int
+        self,
+        epoch: int,
+        extra: bool | None = None,
+        loader: torch.utils.data.DataLoader | None = None,
     ) -> tuple[float, dict[str, float], dict[str, float], dict[str, torch.Tensor] | None]:
-        
+        """Evaluation pass on ``loader`` (default: the validation loader).
+
+        ``extra`` enables the expensive metrics (HD95); by default they run every
+        ``hd95_freq`` epochs."""
+        loader = self.val_loader if loader is None else loader
+
+        if extra is None:
+            extra = self.hd95_freq > 0 and epoch % self.hd95_freq == 0
+
         self.model.eval()
         self.metric_manager.reset()
 
@@ -261,13 +301,13 @@ class Trainer:
         num_batches = 0
 
         sampler = None
-        if self.qualitative_enabled and epoch % self.qualitative_freq == 0:
+        if self.qualitative_enabled:
             sampler = QualitativeSampler.from_config(
                 self.qualitative_cfg, self.num_classes, seed=self.seed
             )
 
         progress = tqdm(
-            self.val_loader,
+            loader,
             desc=f"Epoch {epoch} [Val]",
             leave=False,
         )
@@ -283,7 +323,7 @@ class Trainer:
                         raise RuntimeError("Model returned no loss and no loss function is configured.")
                     loss = self.loss_fn(predictions, masks)
 
-            self.metric_manager.update(predictions.detach(), masks.detach())
+            self.metric_manager.update(predictions.detach(), masks.detach(), extra=extra)
 
             running_loss += loss.detach().item()
             num_batches += 1
@@ -298,6 +338,9 @@ class Trainer:
         per_class = self.metric_manager.compute_per_class()
 
         qualitative_batch = sampler.result() if sampler is not None else None
+        if qualitative_batch is not None:
+            # same matrix the accumulated Dice/IoU are computed from
+            qualitative_batch["confusion_matrix"] = self.metric_manager.confusion_matrix().numpy()
 
         return loss_value, metrics, per_class, qualitative_batch
 
@@ -371,7 +414,7 @@ class Trainer:
                 metrics=metrics,
                 kind="last",
                 scheduler_stepped=True,
-                upload_to_wandb=self.upload_last_to_wandb,
+                upload_to_wandb=False,
                 aliases=[f"epoch-{epoch}", "last", "latest"],
             )
 
@@ -393,8 +436,78 @@ class Trainer:
                 metrics=metrics,
                 kind="periodic",
                 scheduler_stepped=True,
-                upload_to_wandb=self.upload_last_to_wandb,
+                upload_to_wandb=False,
                 aliases=[f"epoch-{epoch}", "periodic"],
+            )
+
+    def _weights_payload(
+        self, kind: str, epoch: int, state_dict: dict[str, Any], metrics: dict[str, float]
+    ) -> dict[str, Any]:
+        """Weights-only checkpoint: enough to rebuild the model and run inference."""
+        try:
+            config = OmegaConf.to_container(self.cfg, resolve=True) if OmegaConf.is_config(self.cfg) else None
+        except Exception:  # unresolved interpolations outside a Hydra run
+            config = OmegaConf.to_container(self.cfg, resolve=False)
+        return {
+            "kind": kind,
+            "epoch": int(epoch),
+            "model_state_dict": {k: v.detach().cpu() for k, v in state_dict.items()},
+            "metrics": dict(metrics or {}),
+            "best_epoch": int(self.best_epoch),
+            "best_score": float(self.best_score) if np.isfinite(self.best_score) else None,
+            "config": config,
+        }
+
+    def _save_final_weights(self) -> None:
+        """Save, overwriting, the weights of the BEST and of the LAST epoch (weights only).
+
+        Local files: ``weights_best_*.pt`` and ``weights_last_*.pt`` next to the full checkpoints.
+        W&B: two model artifacts, ``<name>_best`` and ``<name>_last`` (alias ``best`` / ``last`` and
+        ``latest``), uploaded once, only if ``checkpoint.upload_best_to_wandb`` /
+        ``upload_last_to_wandb`` are true. A new training of the same run adds a new artifact
+        version and moves the aliases; W&B cannot overwrite a version.
+        """
+        entries: list[tuple[str, int, dict[str, Any], dict[str, float], Path, bool]] = []
+
+        # LAST: the weights the model holds now (the stopping epoch with early stopping)
+        last_epoch = self.last_epoch if self.last_epoch > 0 else max(self.start_epoch - 1, 0)
+        entries.append(("last", last_epoch, self.model.state_dict(), self.last_metrics,
+                        self.last_weights_path, self.upload_last_to_wandb))
+
+        # BEST: from the best checkpoint saved at the best epoch
+        if self.best_checkpoint_path.is_file():
+            best = load_checkpoint_file(self.best_checkpoint_path)
+            entries.append(("best", int(best.get("epoch", self.best_epoch)), best["model_state_dict"],
+                            best.get("metrics") or self.best_metrics, self.best_weights_path,
+                            self.upload_best_to_wandb))
+        else:
+            print("[Weights] No best checkpoint found: only the last weights are saved.", flush=True)
+
+        for kind, epoch, state_dict, metrics, path, upload in entries:
+            payload = self._weights_payload(kind, epoch, state_dict, metrics)
+            if self.logger is not None:
+                self.logger.log_checkpoint(
+                    checkpoint=payload,
+                    checkpoint_path=path,
+                    name=f"{self.artifact_base_name}_{kind}",
+                    aliases=[kind, "latest", f"epoch-{epoch}"],
+                    upload_to_wandb=upload,
+                    metadata={
+                        "kind": kind,
+                        "epoch": int(epoch),
+                        "weights_only": True,
+                        "dataset": str(self.cfg.data.name),
+                        "model": str(self.cfg.model.name),
+                        "lr": self.initial_lr_str,
+                    },
+                )
+            else:
+                atomic_torch_save(payload, path)
+            uploaded = bool(upload and self.logger is not None and getattr(self.logger, "is_active", False))
+            print(
+                f"[Weights] {kind} (epoch {epoch}) saved to {path}"
+                + (f" and uploaded to W&B as '{self.artifact_base_name}_{kind}'" if uploaded else ""),
+                flush=True,
             )
 
     def _align_resumed_scheduler(
@@ -486,9 +599,12 @@ class Trainer:
 
     # Early stopping
     def _is_improvement(self, score: float) -> bool:
+        # best_score starts at +-inf: the first finite score always counts
+        if not np.isfinite(self.best_score):
+            return True
         if self.monitor_mode == "min":
-            return score < self.best_score
-        return score > self.best_score
+            return score < self.best_score - self.min_delta
+        return score > self.best_score + self.min_delta
 
     def _update_best(
         self,
@@ -512,18 +628,16 @@ class Trainer:
         self.best_metrics = dict(metrics)
         self.epochs_without_improvement = 0
 
-        best_aliases = [f"epoch-{epoch}", "best"]
-        if not self.upload_last_to_wandb:
-            best_aliases.append("latest")
-
+        # Full checkpoint (for the resume), overwritten at every improvement. Local only: the weights
+        # are uploaded to W&B once, at the end of the training (see _save_final_weights).
         self._save_checkpoint(
             path=self.best_checkpoint_path,
             epoch=epoch,
             metrics=metrics,
             kind="best",
             scheduler_stepped=False,
-            upload_to_wandb=self.upload_best_to_wandb,
-            aliases=best_aliases,
+            upload_to_wandb=False,
+            aliases=[f"epoch-{epoch}", "best"],
         )
 
         return True
@@ -593,6 +707,16 @@ class Trainer:
 
                     improved = self._update_best(epoch, val_metrics)
 
+                    self.last_epoch = epoch
+                    self.last_metrics = dict(val_metrics)
+                    self.last_per_class = dict(per_class_results)
+                    if qualitative_batch is not None:
+                        self._last_qualitative = (epoch, qualitative_batch)
+                        if improved:
+                            self._best_qualitative = (epoch, qualitative_batch)
+                    if improved:
+                        self.best_per_class = dict(per_class_results)
+
                     if not improved:
                         self.epochs_without_improvement += 1
 
@@ -622,6 +746,7 @@ class Trainer:
                     if self.early_stopping_enabled and self.epochs_without_improvement >= self.patience:
                         print("Early stopping triggered.")
                         should_stop = True
+                        self.stopped_early = True
 
                 else:
                     epoch_time = time.perf_counter() - epoch_start
@@ -644,6 +769,15 @@ class Trainer:
                 if should_stop:
                     break
 
+        self._save_final_weights()
+
+        if self.logger is not None and hasattr(self.logger, "log_final_qualitative"):
+            self.logger.log_final_qualitative(
+                best=self._best_qualitative,
+                last=self._last_qualitative,
+                class_labels=self.class_labels,
+            )
+
         best_ckpt_path = self.best_checkpoint_path
         if not best_ckpt_path.exists():
             if self.last_checkpoint_path.exists():
@@ -656,6 +790,12 @@ class Trainer:
             "best_epoch": self.best_epoch,
             "best_score": self.best_score,
             "best_metrics": self.best_metrics,
+            "best_per_class": self.best_per_class,
+            "last_epoch": self.last_epoch,
+            "last_metrics": self.last_metrics,
+            "last_per_class": self.last_per_class,
+            "stopped_early": self.stopped_early,
+            "max_epochs": self.max_epochs,
             "best_checkpoint": str(best_ckpt_path),
             "last_checkpoint": str(self.last_checkpoint_path),
         }
