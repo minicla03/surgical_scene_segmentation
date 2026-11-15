@@ -1,0 +1,5 @@
+fold,train_videos,train_frames,validation_videos,validation_frames,test_videos,test_frames,validation_ids
+0,13,6400,4,1680,0,0,"video18, video20, video24, video27"
+1,14,6640,3,1440,0,0,"video25, video26, video52"
+2,13,6640,4,1440,0,0,"video35, video43, video48, video55"
+3,14,6720,3,1360,0,0,"video17, video28, video37"

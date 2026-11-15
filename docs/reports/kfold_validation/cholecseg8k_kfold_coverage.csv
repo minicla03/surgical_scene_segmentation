@@ -1,0 +1,14 @@
+class_id,class,videos,single_video,target_folds,valid_folds,valid_fold_ids,in_test,fold0,fold1,fold2,fold3
+0,Background,17,False,4,4,"0, 1, 2, 3",False,ok,ok,ok,ok
+1,Abdominal Wall,16,False,4,4,"0, 1, 2, 3",False,ok,ok,ok,ok
+2,Liver,17,False,4,4,"0, 1, 2, 3",False,ok,ok,ok,ok
+3,Gastrointestinal Tract,13,False,4,4,"0, 1, 2, 3",False,ok,ok,ok,ok
+4,Fat,17,False,4,4,"0, 1, 2, 3",False,ok,ok,ok,ok
+5,Grasper,16,False,4,4,"0, 1, 2, 3",False,ok,ok,ok,ok
+6,Connective Tissue,2,False,0,0,,False,n/a (not in val),n/a (not in val),n/a (not in val),n/a (not in val)
+7,Blood,1,True,0,0,,False,n/a (not in val),n/a (not in val),n/a (not in val),n/a (not in val)
+8,Cystic Duct,3,False,1,1,3,False,n/a (not in val),n/a (not in val),n/a (not in val),ok
+9,L-hook Electrocautery,9,False,4,4,"0, 1, 2, 3",False,ok,ok,ok,ok
+10,Gallbladder,16,False,4,4,"0, 1, 2, 3",False,ok,ok,ok,ok
+11,Hepatic Vein,1,True,0,0,,False,n/a (not in val),n/a (not in val),n/a (not in val),n/a (not in val)
+12,Liver Ligament,1,True,0,0,,False,n/a (not in val),n/a (not in val),n/a (not in val),n/a (not in val)

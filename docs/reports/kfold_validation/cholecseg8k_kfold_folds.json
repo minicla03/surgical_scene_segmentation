@@ -1,0 +1,170 @@
+{
+  "n_folds": 4,
+  "seed": 42,
+  "test_ratio": 0.0,
+  "balance_cost": 0.013515846413663726,
+  "class_names": [
+    "Background",
+    "Abdominal Wall",
+    "Liver",
+    "Gastrointestinal Tract",
+    "Fat",
+    "Grasper",
+    "Connective Tissue",
+    "Blood",
+    "Cystic Duct",
+    "L-hook Electrocautery",
+    "Gallbladder",
+    "Hepatic Vein",
+    "Liver Ligament"
+  ],
+  "pinned_train": [
+    "video01",
+    "video09",
+    "video12"
+  ],
+  "test": [],
+  "folds": [
+    {
+      "fold": 0,
+      "train": [
+        "video01",
+        "video09",
+        "video12",
+        "video17",
+        "video25",
+        "video26",
+        "video28",
+        "video35",
+        "video37",
+        "video43",
+        "video48",
+        "video52",
+        "video55"
+      ],
+      "validation": [
+        "video18",
+        "video20",
+        "video24",
+        "video27"
+      ],
+      "test": [],
+      "evaluable_classes": [
+        "Background",
+        "Abdominal Wall",
+        "Liver",
+        "Gastrointestinal Tract",
+        "Fat",
+        "Grasper",
+        "L-hook Electrocautery",
+        "Gallbladder"
+      ]
+    },
+    {
+      "fold": 1,
+      "train": [
+        "video01",
+        "video09",
+        "video12",
+        "video17",
+        "video18",
+        "video20",
+        "video24",
+        "video27",
+        "video28",
+        "video35",
+        "video37",
+        "video43",
+        "video48",
+        "video55"
+      ],
+      "validation": [
+        "video25",
+        "video26",
+        "video52"
+      ],
+      "test": [],
+      "evaluable_classes": [
+        "Background",
+        "Abdominal Wall",
+        "Liver",
+        "Gastrointestinal Tract",
+        "Fat",
+        "Grasper",
+        "L-hook Electrocautery",
+        "Gallbladder"
+      ]
+    },
+    {
+      "fold": 2,
+      "train": [
+        "video01",
+        "video09",
+        "video12",
+        "video17",
+        "video18",
+        "video20",
+        "video24",
+        "video25",
+        "video26",
+        "video27",
+        "video28",
+        "video37",
+        "video52"
+      ],
+      "validation": [
+        "video35",
+        "video43",
+        "video48",
+        "video55"
+      ],
+      "test": [],
+      "evaluable_classes": [
+        "Background",
+        "Abdominal Wall",
+        "Liver",
+        "Gastrointestinal Tract",
+        "Fat",
+        "Grasper",
+        "L-hook Electrocautery",
+        "Gallbladder"
+      ]
+    },
+    {
+      "fold": 3,
+      "train": [
+        "video01",
+        "video09",
+        "video12",
+        "video18",
+        "video20",
+        "video24",
+        "video25",
+        "video26",
+        "video27",
+        "video35",
+        "video43",
+        "video48",
+        "video52",
+        "video55"
+      ],
+      "validation": [
+        "video17",
+        "video28",
+        "video37"
+      ],
+      "test": [],
+      "evaluable_classes": [
+        "Background",
+        "Abdominal Wall",
+        "Liver",
+        "Gastrointestinal Tract",
+        "Fat",
+        "Grasper",
+        "Cystic Duct",
+        "L-hook Electrocautery",
+        "Gallbladder"
+      ]
+    }
+  ]
+}
