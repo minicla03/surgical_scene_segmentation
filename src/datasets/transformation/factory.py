@@ -1,12 +1,62 @@
 from monai.transforms.compose import Compose
 from monai.transforms.croppad.dictionary import RandSpatialCropd, SpatialPadd
-from monai.transforms.intensity.dictionary import NormalizeIntensityd, RandGaussianSmoothd, ScaleIntensityd, RandShiftIntensityd, RandAdjustContrastd
+from monai.transforms.intensity.dictionary import NormalizeIntensityd, RandGaussianSmoothd, ScaleIntensityRanged, RandShiftIntensityd, RandAdjustContrastd
 from monai.transforms.spatial.dictionary import RandAffined, RandFlipd, Resized
 from monai.transforms.utility.dictionary import EnsureChannelFirstd, EnsureTyped
 
 import math
 import numpy as np
 import torch
+import torchvision.transforms.v2.functional as TF
+from monai.transforms import MapTransform, RandomizableTransform
+
+
+class RandColorJitterd(RandomizableTransform, MapTransform):
+    """Color jitter (brightness, contrast, saturation, hue) driven by the MONAI random state.
+
+    Every random draw uses ``self.R``, so ``set_random_state`` (called per worker by ``seed_worker``)
+    controls it like the other MONAI random transforms. The same factors are applied to every key.
+    The four operations are applied in a fixed order (torchvision's ColorJitter shuffles it).
+    Expects float images in [0, 1].
+    """
+
+    def __init__(self, keys, brightness=0.0, contrast=0.0, saturation=0.0, hue=0.0, prob=0.5):
+        MapTransform.__init__(self, keys)
+        RandomizableTransform.__init__(self, prob)
+        self.brightness, self.contrast = float(brightness), float(contrast)
+        self.saturation, self.hue = float(saturation), float(hue)
+        self._factors: dict[str, float] = {}
+
+    def randomize(self, data=None) -> None:
+        super().randomize(None)
+        if not self._do_transform:
+            return
+        draw = lambda amount, center: float(self.R.uniform(center - amount, center + amount)) if amount > 0 else None
+        self._factors = {
+            "brightness": draw(self.brightness, 1.0),
+            "contrast": draw(self.contrast, 1.0),
+            "saturation": draw(self.saturation, 1.0),
+            "hue": draw(self.hue, 0.0),
+        }
+
+    def __call__(self, data):
+        d = dict(data)
+        self.randomize()
+        if not self._do_transform:
+            return d
+
+        for key in self.key_iterator(d):
+            image = d[key]
+            if self._factors["brightness"] is not None:
+                image = TF.adjust_brightness(image, self._factors["brightness"])
+            if self._factors["contrast"] is not None:
+                image = TF.adjust_contrast(image, self._factors["contrast"])
+            if self._factors["saturation"] is not None:
+                image = TF.adjust_saturation(image, self._factors["saturation"])
+            if self._factors["hue"] is not None:
+                image = TF.adjust_hue(image, self._factors["hue"])
+            d[key] = image
+        return d
 
 
 class TransformFactory:
@@ -127,8 +177,15 @@ class TransformFactory:
 
     @staticmethod
     def _add_normalization(transforms: list, image_cfg: dict) -> None:
+        # Fixed rescaling of the 8-bit images to [0, 1] (x / 255). NOT a per-image min-max: the
+        # result must not depend on the content of the single frame, and it matches what the
+        # ImageNet mean/std normalization of the pretrained models expects.
         if image_cfg.get("normalize", False):
-            transforms.append(ScaleIntensityd(keys=["image"]))
+            transforms.append(
+                ScaleIntensityRanged(
+                    keys=["image"], a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0, clip=False
+                )
+            )
 
     @staticmethod
     def _add_type_casting(transforms: list, image_cfg: dict, mask_cfg: dict) -> None:
@@ -349,39 +406,3 @@ class TransformFactory:
     def _degrees_to_radians(values: list | tuple) -> tuple:
         return tuple(math.radians(value) for value in values)
 
-
-from torchvision.transforms.v2 import ColorJitter
-from monai.transforms import MapTransform
-
-
-class RandColorJitterd(MapTransform):
-    """Apply torchvision ColorJitter to selected dictionary keys."""
-
-    def __init__(
-        self,
-        keys,
-        brightness=0.0,
-        contrast=0.0,
-        saturation=0.0,
-        hue=0.0,
-        prob=0.5,
-    ):
-        super().__init__(keys)
-        self.prob = prob
-        self.transform = ColorJitter(
-            brightness=brightness,
-            contrast=contrast,
-            saturation=saturation,
-            hue=hue,
-        )
-
-    def __call__(self, data):
-        d = dict(data)
-
-        if torch.rand(1).item() >= self.prob:
-            return d
-
-        for key in self.keys:
-            d[key] = self.transform(d[key])
-
-        return d

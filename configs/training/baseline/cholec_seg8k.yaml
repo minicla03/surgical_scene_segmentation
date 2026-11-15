@@ -15,8 +15,9 @@ train:
   early_stopping:
     enabled: true
     patience: 10
-    monitor: dice
+    monitor: dice_acc   # accumulated Dice: counts the false positives (see docs/metrics_convention.md)
     mode: max
+    min_delta: 1.0e-3   # gains below this do not reset the patience
 
   optimizer:
     _target_: torch.optim.AdamW
@@ -36,7 +37,7 @@ train:
     to_onehot_y: true
     softmax: true
     gamma: 2.0
-    batch: true
+    batch: false   # Dice per image, then mean: independent of the micro-batch, so accumulation == larger batch
     lambda_dice: 0.5
     lambda_focal: 0.5
     reduction: mean
