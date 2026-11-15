@@ -204,10 +204,21 @@ class DSADDataset(BaseSegmentationDataset):
         DSAD provides official parquet splits, so no new
         percentage split or stratification is performed.
         """
-        if strategy != "official":
-            raise ValueError("DSAD only supports the official split.")
         if group_by != "surgery":
-            raise ValueError("DSAD official split must use group_by='surgery'.")
+            raise ValueError("DSAD splits must use group_by='surgery'.")
+        if strategy == "kfold":
+            return self.create_kfold_split(
+                group_by=group_by,
+                n_folds=kwargs.get("n_folds", 4),
+                fold_index=kwargs.get("fold_index", 0),
+                test_ratio=kwargs.get("test_ratio", 0.0),
+                seed=kwargs.get("seed", 42),
+                balance=kwargs.get("balance", True),
+                n_restarts=kwargs.get("n_restarts", 30),
+                balance_min_pixel_pct=kwargs.get("balance_min_pixel_pct", 1.0),
+            )
+        if strategy != "official":
+            raise ValueError("DSAD supports only the 'official' and 'kfold' strategies.")
         if kwargs:
             unexpected = ", ".join(kwargs.keys())
             raise ValueError(f"Unexpected arguments for DSAD official split: {unexpected}")

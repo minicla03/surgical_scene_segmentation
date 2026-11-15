@@ -60,6 +60,78 @@ class BaseSegmentationDataset(ABC):
         print(f"  Frames : {len(self.samples)}")
         print("=" * 60)
 
+    def create_kfold_split(
+        self,
+        group_by: str = "video",
+        n_folds: int = 4,
+        fold_index: int = 0,
+        test_ratio: float = 0.0,
+        seed: int = 42,
+        balance: bool = True,
+        n_restarts: int = 30,
+        balance_min_pixel_pct: float = 1.0,
+    ):
+        """Group-level K-fold split (see ``src.datasets.kfold``).
+
+        Returns ``(train, validation, test)`` subsets of ``fold_index``; ``test`` is
+        None when ``test_ratio`` is 0. The full plan is kept in ``self.kfold_plan``
+        (evaluable classes per fold, pinned videos, coverage tables).
+        """
+        from torch.utils.data import Subset
+
+        from src.datasets.kfold import resolve_kfold_splits
+
+        indices, plan = resolve_kfold_splits(
+            self,
+            {
+                "group_by": group_by,
+                "n_folds": n_folds,
+                "fold_index": fold_index,
+                "test_ratio": test_ratio,
+                "seed": seed,
+                "balance": balance,
+                "n_restarts": n_restarts,
+                "balance_min_pixel_pct": balance_min_pixel_pct,
+            },
+        )
+        self.kfold_plan = plan
+        self.kfold_fold_index = int(fold_index)
+        self._print_kfold_split(plan, int(fold_index))
+
+        test = Subset(self, indices["test"]) if indices["test"] else None
+        return Subset(self, indices["train"]), Subset(self, indices["validation"]), test
+
+    @staticmethod
+    def _print_kfold_split(plan, fold_index: int) -> None:
+        groups = plan.groups_for(fold_index)
+        row = plan.fold_table().iloc[fold_index]
+        evaluable = plan.evaluable_classes(fold_index)
+
+        print("\n" + "=" * 60)
+        print(f"K-FOLD SPLIT (fold {fold_index + 1}/{plan.n_folds}, seed={plan.seed})")
+        print("=" * 60)
+        for split in ("train", "validation", "test"):
+            if split == "test" and not groups["test"]:
+                continue
+            print(f"\n{split.capitalize()}:")
+            print(f"  Groups : {groups[split]}")
+            print(f"  Frames : {int(row[f'{split}_frames'])}")
+        if plan.pinned:
+            pinned = {
+                plan.group_ids[g]: [plan.class_names[c] for c in classes]
+                for g, classes in plan.pinned_reasons.items()
+            }
+            print(f"\nPinned to train (hold single-video classes): {pinned}")
+        print(
+            "\nEvaluated classes   : "
+            f"{[n for n, ok in zip(plan.class_names, evaluable) if ok]}"
+        )
+        print(
+            "NaN (not evaluable) : "
+            f"{[n for n, ok in zip(plan.class_names, evaluable) if not ok]}"
+        )
+        print("=" * 60)
+
     def get_class_distribution(self, indices: list[int]) -> dict[int, dict[str, int | float]]:
         """Compute pixel distribution for each class."""
 

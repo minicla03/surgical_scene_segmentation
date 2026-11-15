@@ -31,12 +31,15 @@ train:
     _target_: torch.cuda.amp.GradScaler
 
   loss:
-    _target_: monai.losses.DiceCELoss
+    _target_: monai.losses.DiceFocalLoss
     include_background: true
     to_onehot_y: true
     softmax: true
+    gamma: 2.0
+    batch: true
     lambda_dice: 0.5
-    lambda_ce: 0.5
+    lambda_focal: 0.5
+    reduction: mean
 
 evaluation:
   metrics:

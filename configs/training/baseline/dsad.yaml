@@ -40,7 +40,8 @@ train:
     include_background: true
     to_onehot_y: true
     softmax: true
-    gamma: 1.0
+    gamma: 2.0
+    batch: true
     lambda_dice: 0.5
     lambda_focal: 0.5
     reduction: mean

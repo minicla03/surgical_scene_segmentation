@@ -6,6 +6,9 @@ defaults:
 
 experiment:
   seed: 42
+  # true: one run per seed on the same (official) split. Names, group, tags and checkpoint
+  # directory get the seed, so the runs do not collide (set by the submit scripts).
+  seed_runs: false
   debug: false
 
 paths:
@@ -28,7 +31,7 @@ logging:
 
   qualitative:
     enabled: true
-    frequency: 1       # every N validation epochs
+    frequency: 10      # every N validation epochs (best and last epoch are always logged at the end)
     num_worst: 4       # lowest per-image Dice
     num_best: 2        # highest per-image Dice
     num_random: 2      # uniformly sampled (fixed seed)
@@ -40,8 +43,12 @@ logging:
 checkpoint:
   save_last: true
   save_every_n_epochs: null
+  # W&B: ONCE, at the end of the training, the weights (no optimizer state) of the best epoch and of
+  # the last epoch, as the model artifacts <name>_best and <name>_last. Nothing is uploaded during the
+  # training. Locally, best_*.pt / last_*.pt (full, for the resume) and weights_best_*.pt /
+  # weights_last_*.pt (weights only) are overwritten.
   upload_best_to_wandb: true
-  upload_last_to_wandb: false
+  upload_last_to_wandb: true
 
 resume:
   enabled: false

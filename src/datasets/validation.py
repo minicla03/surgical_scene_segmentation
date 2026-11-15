@@ -637,6 +637,112 @@ def flag_classes(
 
 
 # ============================================================
+# K-FOLD CLASS DISTRIBUTION
+# ============================================================
+
+def kfold_class_distribution(
+    dataset: Any,
+    plan: Any,
+    group_key: str = "video",
+    cache: dict[int, tuple[np.ndarray, int]] | None = None,
+) -> pd.DataFrame:
+    """
+    Frames, pixels and videos per class in the train / validation (/ test) set of every fold.
+
+    ``plan`` is a ``src.datasets.kfold.KFoldPlan`` (used through ``n_folds``,
+    ``groups_for(fold)`` and ``evaluable_matrix()``, so no import is needed here).
+
+    One row per (fold, split, class):
+        frames, frame_percentage   frames containing the class (>= 1 pixel) and % of the split's frames
+        pixels, pixel_percentage   class pixels and % over the split's valid pixels
+        videos, total_videos       videos containing the class and videos in the split
+        total_frames, valid_pixels, ignored_pixels   size of the split
+        evaluable                  the class can be evaluated in this fold (in train AND validation)
+    """
+    samples = get_samples(dataset)
+    group_key = _resolve_group_key(samples, group_key)
+    groups = _group_indices(samples, group_key)
+    if cache is None:
+        cache = compute_sample_counts(dataset, [i for idx in groups.values() for i in idx])
+
+    class_names = get_class_names(dataset)
+    evaluable = plan.evaluable_matrix()
+
+    tables = []
+    for fold in range(plan.n_folds):
+        for split, ids in plan.groups_for(fold).items():
+            if split == "test" and not ids:
+                continue
+            indices = [i for group in ids for i in groups[group]]
+            table = _statistics_frame(
+                class_names, [cache[i] for i in indices], fold=fold, split=split
+            )
+
+            video_presence = np.zeros(len(class_names), dtype=np.int64)
+            for group in ids:
+                video_presence += np.sum([cache[i][0] for i in groups[group]], axis=0) > 0
+            table["videos"] = video_presence
+            table["total_videos"] = len(ids)
+            table["evaluable"] = evaluable[fold]
+            tables.append(table)
+
+    out = pd.concat(tables, ignore_index=True).rename(columns={
+        "samples": "frames",
+        "sample_percentage": "frame_percentage",
+        "total_samples": "total_frames",
+    })
+    return out[[
+        "fold", "split", "class_id", "class", "frames", "frame_percentage",
+        "pixels", "pixel_percentage", "videos", "total_videos", "total_frames",
+        "valid_pixels", "ignored_pixels", "evaluable",
+    ]]
+
+
+def kfold_distribution_deviation(
+    dist: pd.DataFrame, min_pixel_percentage: float = 1.0
+) -> pd.DataFrame:
+    """
+    How well every validation fold keeps the class distribution of the dataset.
+
+    ``dist`` is the output of :func:`kfold_class_distribution`. One row per (fold, class):
+
+        global_pct         pixel share of the class over the whole dataset (%)
+        pool_pct           pixel share over the videos that can be validated (all validation folds
+                           together: without the videos pinned to train and the test set); this is
+                           the reference, since the validation folds partition exactly that pool
+        train_pct, val_pct pixel share in the train / validation set of the fold (%)
+        abs_dev            val_pct - pool_pct (percentage points)
+        rel_dev            100 * (val_pct - pool_pct) / pool_pct (%): 0 = same share as the pool
+        populous           pool_pct >= min_pixel_percentage
+        evaluable          the class can be evaluated in the fold
+    """
+    val = dist[dist["split"] == "validation"]
+    train = dist[dist["split"] == "train"]
+
+    pool_pixels = val.groupby("class_id")["pixels"].sum()
+    pool_total = float(val.drop_duplicates("fold")["valid_pixels"].sum())
+    first = dist[dist["fold"] == dist["fold"].min()]
+    global_pixels = first.groupby("class_id")["pixels"].sum()   # train + validation (+ test) of one fold
+    global_total = float(first.drop_duplicates("split")["valid_pixels"].sum())
+
+    rows = val[["fold", "class_id", "class", "pixel_percentage", "evaluable"]].rename(
+        columns={"pixel_percentage": "val_pct"}
+    ).copy()
+    rows["train_pct"] = rows.merge(
+        train[["fold", "class_id", "pixel_percentage"]], on=["fold", "class_id"], how="left"
+    )["pixel_percentage"].to_numpy()
+    rows["global_pct"] = rows["class_id"].map(100.0 * global_pixels / global_total)
+    rows["pool_pct"] = rows["class_id"].map(100.0 * pool_pixels / pool_total)
+    rows["abs_dev"] = rows["val_pct"] - rows["pool_pct"]
+    rows["rel_dev"] = np.where(rows["pool_pct"] > 0, 100.0 * rows["abs_dev"] / rows["pool_pct"], np.nan)
+    rows["populous"] = rows["pool_pct"] >= min_pixel_percentage
+    return rows[[
+        "fold", "class_id", "class", "global_pct", "pool_pct", "train_pct", "val_pct",
+        "abs_dev", "rel_dev", "populous", "evaluable",
+    ]].sort_values(["fold", "class_id"]).reset_index(drop=True)
+
+
+# ============================================================
 # MAIN VALIDATOR
 # ============================================================
 

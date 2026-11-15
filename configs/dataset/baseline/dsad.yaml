@@ -25,9 +25,21 @@ data:
     multi_organ: 8
 
   split:
+    # official : DSAD official train/validation/test split (comparable with the published results).
+    #            Spleen is absent from validation AND test: its metrics are N/A.
+    #            Variance is estimated with 3 training seeds (experiment.seed), not with folds.
+    # kfold    : group-level K-fold (src/datasets/kfold.py), kept available but not used for DSAD.
     strategy: official
     group_by: surgery
-    stratified: false
+    seed: 42            # split seed (kfold only)
+
+    # --- kfold (only with strategy=kfold) ---
+    n_folds: 4
+    fold_index: 0
+    test_ratio: 0.0     # fraction of surgeries held out as test BEFORE the K-fold (0 = no test)
+    balance: true       # balance the class distribution (pixel share) across the validation folds
+    n_restarts: 30
+    balance_min_pixel_pct: 1.0
 
 
 # ============================================================

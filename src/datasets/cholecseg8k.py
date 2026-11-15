@@ -342,12 +342,29 @@ class CholecSeg8kDataset(BaseSegmentationDataset):
         test_ratio: float = 0.15,
         seed: int = 42,
         stratified: bool = True,
+        n_folds: int = 4,
+        fold_index: int = 0,
+        balance: bool = True,
+        n_restarts: int = 30,
+        balance_min_pixel_pct: float = 1.0,
     ) -> tuple[Subset, Subset, Subset | None]:
         """Create train, validation and optional test splits."""
 
         if group_by != "video":
             raise ValueError(
                 "CholecSeg8k supports splitting only by video."
+            )
+
+        if strategy == "kfold":
+            return self.create_kfold_split(
+                group_by=group_by,
+                n_folds=n_folds,
+                fold_index=fold_index,
+                test_ratio=test_ratio,
+                seed=seed,
+                balance=balance,
+                n_restarts=n_restarts,
+                balance_min_pixel_pct=balance_min_pixel_pct,
             )
 
         if strategy == "official":

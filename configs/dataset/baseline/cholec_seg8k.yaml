@@ -15,16 +15,26 @@ data:
   num_classes: 13
 
   split:
-    strategy: percentage
+    # kfold      : group-level K-fold (src/datasets/kfold.py). One process per fold:
+    #              python start_experiment.py -m data.split.fold_index=0,1,2,3
+    # percentage : single train/val(/test) split (needs train_ratio / val_ratio).
+    strategy: kfold
 
     group_by: video
-    seed: 42
+    seed: 42            # split seed: must be identical across the folds of one CV
 
+    # --- kfold ---
+    n_folds: 4
+    fold_index: 0
+    test_ratio: 0.0     # fraction of videos held out as test BEFORE the K-fold (0 = no test)
+    balance: true       # balance the class distribution (pixel share) across the validation folds
+    n_restarts: 30      # deterministic restarts of the assignment (seed, seed+1, ...)
+    balance_min_pixel_pct: 1.0   # classes below this % of pixels do not enter the balance
+
+    # --- percentage (used only with strategy=percentage) ---
     stratified: true #https://medium.com/gumgum-tech/creating-balanced-multi-label-datasets-for-model-training-and-evaluation-16b6a3a2d912
-
     train_ratio: 0.7
     val_ratio: 0.3
-    test_ratio: 0.0
 
 # ============================================================
 # PREPROCESSING
